@@ -1,0 +1,19 @@
+{
+  "name": "my-first-eval",
+  "model": "gpt-4o",
+  "prompt": "You are a helpful assistant. Answer the question: {{input}}",
+  "scorers": [
+    "exact-match",
+    "contains"
+  ],
+  "cases": [
+    {
+      "input": "What is 2+2?",
+      "expectedOutput": "4"
+    },
+    {
+      "input": "What color is the sky?",
+      "expectedOutput": "blue"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "$schema": "https://evalguard.ai/schema/config.json",
+  "projectId": "cli-test",
+  "defaultModel": "gpt-4o",
+  "evalsDir": "./evals",
+  "scansDir": "./scans"
+}

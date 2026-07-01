@@ -1,0 +1,20 @@
+{
+  "name": "@evalguard/cli",
+  "version": "3.3.0",
+  "description": "EvalGuard CLI — LLM evaluation, red-team security scans, prompt firewall, and CI gating from the terminal.",
+  "type": "module",
+  "bin": { "evalguard": "./bin/evalguard.js" },
+  "files": ["dist", "bin", "README.md", "LICENSE"],
+  "scripts": { "build": "tsc", "type-check": "tsc --noEmit", "test": "vitest run" },
+  "keywords": ["llm","evaluation","ai","security","red-team","prompt-injection","guardrails","cli","evalguard","ci"],
+  "license": "Apache-2.0",
+  "engines": { "node": ">=18" },
+  "repository": { "type": "git", "url": "https://github.com/EvalGuardAi/evalguard-cli.git" },
+  "homepage": "https://evalguard.ai",
+  "bugs": { "url": "https://github.com/EvalGuardAi/evalguard-cli/issues" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
+  "dependencies": { "@evalguard/core": "^1.4.0", "commander": "^15.0.0", "chalk": "^5.4.0", "ora": "^9.4.0", "yaml": "^2.9.0" },
+  "peerDependencies": { "@evalguard/quickjs-runner": "*" },
+  "peerDependenciesMeta": { "@evalguard/quickjs-runner": { "optional": true } },
+  "devDependencies": { "@types/node": "^26.0.0", "tsx": "^4.22.4", "typescript": "^6.0.3", "vitest": "^4.1.9" }
+}

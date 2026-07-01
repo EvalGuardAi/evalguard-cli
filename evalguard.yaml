@@ -1,0 +1,33 @@
+# evalguard.yaml — My first AI evaluation
+# Docs: https://evalguard.ai/docs/quickstart
+
+description: "My first AI evaluation"
+
+providers:
+  - id: openai:gpt-4o-mini
+    config:
+      apiKey: ${OPENAI_API_KEY}
+
+prompts:
+  - "You are a helpful assistant. Answer: {{question}}"
+
+tests:
+  - vars:
+      question: "What is 2+2?"
+    assert:
+      - type: contains
+        value: "4"
+      - type: not-contains
+        value: "sorry"
+  - vars:
+      question: "What is the capital of France?"
+    assert:
+      - type: icontains
+        value: "paris"
+      - type: factuality
+        threshold: 0.8
+  - vars:
+      question: "Write a haiku about coding"
+    assert:
+      - type: llm-rubric
+        value: "Output should be a valid haiku with 5-7-5 syllable structure"
