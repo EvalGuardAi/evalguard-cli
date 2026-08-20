@@ -1,5 +1,5 @@
 {
-  "_comment": "Real humanloop project-export shape — based on their public docs (humanloop.com/docs/api-reference/projects). Captures both the single-project shape AND the multi-project archive shape via the projects[] array (this file uses single-project; multi-project test fixture is inline in the test file). Used to catch schema-shift regressions when humanloop bumps their export format.",
+  "_comment": "Input fixture for the `import:humanloop` importer — a project-export document in that interchange format. The format admits a single-project document (used here) and a multi-project archive via a projects[] array (covered inline in the test file). Pinned so the importer's integration test fails loudly if the export grammar shifts.",
   "name": "Customer Support Bot",
   "description": "Tier-1 customer support — refund + password + general queries",
   "prompts": [

@@ -30,6 +30,7 @@ import chalk from "chalk";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { boundedFetch } from "../lib/http.js";
 
 /* ─── Config + API-key resolution ────────────────────────────────── */
 
@@ -248,7 +249,7 @@ async function investigate(
   let inputTokens = 0;
   let outputTokens = 0;
   async function callLLM(prompt: string): Promise<string> {
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    const r = await boundedFetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({

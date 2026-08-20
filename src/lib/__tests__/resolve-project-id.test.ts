@@ -1,15 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { resolveProjectId, resetResolvedProjectId } from "../config.js";
+import { jsonResponse } from "../../__tests__/helpers/response-double.js";
 
 // Mock the HTTP layer (global fetch) — never hit the network.
-function mockFetchOnce(body: unknown, ok = true, status = 200): void {
+// `ok` is derived from `status` by a real Response, so it is no longer a
+// separate knob — the two can no longer be set to contradict each other.
+function mockFetchOnce(body: unknown, _ok = true, status = 200): void {
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => ({
-      ok,
-      status,
-      json: async () => body,
-    })) as unknown as typeof fetch,
+    // Real Response: `resolveProjectId` now decodes through the shared
+    // fail-closed boundary (lib/http.ts), which reads `res.text()` so it can
+    // tell an empty body from `null` from unparseable bytes.
+    vi.fn(async () => jsonResponse(body, status)) as unknown as typeof fetch,
   );
 }
 

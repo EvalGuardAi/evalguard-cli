@@ -2,6 +2,15 @@ import { describe, expect, it } from "vitest";
 import { Command } from "commander";
 import { hasAdvancedRails, scanWithAdvancedRails, registerFirewall } from "../firewall.js";
 
+// Import-phase warm-up. `await import()` inside a test body is billed against
+// `testTimeout`, and this file reaches `@evalguard/core` lazily, so the first
+// case to touch it paid for the whole 2,173-file graph — ~5 s idle, and past
+// the budget under the pre-push sweep. Loading it here moves that cost into
+// the file's import phase, which vitest bills against no per-test budget.
+// Must be top-level `await import`, not a static import: vitest hoists
+// `vi.mock` above static imports. Full rationale: src/__tests__/cli-smoke.test.ts
+await import("@evalguard/core");
+
 describe("hasAdvancedRails", () => {
   it("is false when no advanced flag is set (legacy path preserved)", () => {
     expect(hasAdvancedRails({})).toBe(false);
@@ -22,7 +31,7 @@ describe("scanWithAdvancedRails (input rails via core FirewallEngine)", () => {
     expect(Array.isArray(result.layers)).toBe(true);
     // The gcg-perplexity layer must be present when --advanced-gcg is set.
     expect(result.layers.some((l) => l.layer === "gcg-perplexity")).toBe(true);
-  }, 30_000);
+  });
 
   it("flags an adversarial-suffix (GCG-style) gibberish input via the gcg rail", async () => {
     const adversarial =
@@ -32,7 +41,7 @@ describe("scanWithAdvancedRails (input rails via core FirewallEngine)", () => {
     expect(gcgLayer).toBeDefined();
     // The adversarial suffix should at least register a non-zero gcg score.
     expect(gcgLayer!.score).toBeGreaterThan(0);
-  }, 30_000);
+  });
 });
 
 describe("scanWithAdvancedRails (output rails via core FirewallEngine)", () => {
@@ -41,7 +50,7 @@ describe("scanWithAdvancedRails (output rails via core FirewallEngine)", () => {
     const result = await scanWithAdvancedRails(leaked, { yaraOutput: true, output: true });
     expect(Array.isArray(result.layers)).toBe(true);
     expect(result.layers.some((l) => l.layer.includes("yara"))).toBe(true);
-  }, 30_000);
+  });
 });
 
 describe("registerFirewall advanced-rails flags", () => {

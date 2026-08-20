@@ -15,13 +15,15 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
 import * as readline from "node:readline";
+import { boundedFetch, decodeJsonBody, readArtifactBody } from "../lib/http.js";
 
 function baseUrl(): string {
-  return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  return resolveBaseUrl();
 }
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) {
     console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`."));
     process.exit(1);
@@ -29,7 +31,7 @@ function apiKey(): string {
   return k;
 }
 async function apiFetch(path: string, init: RequestInit = {}): Promise<unknown> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${apiKey()}`,
@@ -37,7 +39,7 @@ async function apiFetch(path: string, init: RequestInit = {}): Promise<unknown> 
       ...(init.headers ?? {}),
     },
   });
-  const body = (await res.json().catch(() => null)) as { data?: unknown; error?: { message?: string } } | null;
+  const body = (await decodeJsonBody(res, `${path}`)) as { data?: unknown; error?: { message?: string } } | null;
   if (!res.ok) {
     throw new Error(body?.error?.message ?? `HTTP ${res.status}`);
   }
@@ -276,15 +278,28 @@ export function registerDatasets(program: Command): void {
     .option("--out <path>", "Write to a file instead of stdout")
     .action(async (datasetId: string, versionId: string, opts: { format?: string; out?: string }) => {
       const url = `${baseUrl()}/datasets/${encodeURIComponent(datasetId)}/versions/${encodeURIComponent(versionId)}/export?format=${encodeURIComponent(opts.format ?? "openai-jsonl")}`;
-      const res = await fetch(url, {
+      const res = await boundedFetch(url, {
         headers: { Authorization: `Bearer ${apiKey()}` },
       });
       if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
+        const body = (await decodeJsonBody(res, "GET /datasets/:id/versions/:id/export")) as
+          | { error?: { message?: string } }
+          | null;
         console.error(chalk.red(body?.error?.message ?? `HTTP ${res.status}`));
         process.exit(1);
       }
-      const text = await res.text();
+      // Same boundary as `ai-bom export` / `cost-export` (audit 2026-08-09):
+      // this used to be a bare `res.text()` straight into `fs.writeFile`, so an
+      // nginx 502 page or 2 MB of filler became "✓ Wrote ? cases". `X-Case-Count`
+      // is set by the export route and by nothing else, so it is the proof that
+      // lets a genuinely-empty (0-case) version still export.
+      const caseCountHeader = res.headers.get("X-Case-Count");
+      const text = await readArtifactBody(res, {
+        endpoint: "GET /datasets/:id/versions/:id/export",
+        format: (opts.format ?? "openai-jsonl") === "csv" ? "csv" : "ndjson",
+        what: "dataset export",
+        allowEmpty: caseCountHeader === "0",
+      });
       if (opts.out) {
         // Lazy import; avoid pulling node:fs into every CLI subcommand.
         const fs = await import("node:fs/promises");

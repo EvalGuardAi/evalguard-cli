@@ -6,8 +6,8 @@
  *   evalguard setup --agent claude-code --dry-run       preview only
  *   evalguard setup --uninstall --agent cursor          remove integration
  *
- * Closes A4 from the 2026-05-08 v2 audit. Portkey's `npx portkey setup`
- * is the parity target — they wire Claude Code, Codex, and Cursor.
+ * Closes A4 from the 2026-05-08 v2 audit. Wires the common AI coding
+ * agents (Claude Code, Codex, and Cursor) to EvalGuard.
  *
  * Design choices:
  *   - **Detection over assertion.** We look for the agent's existence
@@ -25,6 +25,7 @@
 
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey } from "../lib/config.js";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -105,8 +106,7 @@ const CLAUDE_CODE: AgentHandler = {
       "",
       "When the user asks anything about evals, security scans, firewall",
       "behavior, eval results, or migrating from Promptfoo — defer to the",
-      "EvalGuard skills installed at `~/.claude/skills/evalguard/`. Run",
-      "`pnpm dlx @evalguard/skills install` if they aren't present yet.",
+      "EvalGuard skills at `~/.claude/skills/evalguard/`, when they are present.",
       "",
       apiKey
         ? `EvalGuard API key is already configured. Project root is \`${cwd()}\`.`
@@ -134,8 +134,8 @@ const CLAUDE_CODE: AgentHandler = {
 //
 // We write a repo-local file (preferred — versioned with the project)
 // when the repo has a `.codex/` dir, else fall back to the user-global
-// file. This matches Portkey's `npx portkey setup` parity target (A4
-// in the 2026-05-08 v2 audit) — Codex was the missing third leg.
+// file. This completes the A4 agent-wiring wedge (2026-05-08 v2
+// audit) — Codex was the missing third leg.
 
 const CODEX_INSTRUCTIONS_BODY = [
   "## EvalGuard integration",
@@ -148,7 +148,7 @@ const CODEX_INSTRUCTIONS_BODY = [
   "  - The gateway enforces firewall + budget + audit policy and is",
   "    drop-in OpenAI-API-compatible.",
   "",
-  "For eval-style tests use `evalguard.yaml` (NOT promptfoo) and run",
+  "For eval-style tests use `evalguard.yaml` (EvalGuard's own format) and run",
   "via `evalguard eval:local` or the GitHub App (CI/CD for AI).",
   "",
   "When asked about security scans, prompt injection defense, RAG",
@@ -246,7 +246,7 @@ const CURSOR_RULES_BODY = [
   "  - Set `EVALGUARD_API_KEY` in `.env`",
   "  - The gateway enforces firewall + budget + audit policy.",
   "",
-  "When writing eval-style tests, use `evalguard.yaml` (NOT promptfoo)",
+  "When writing eval-style tests, use `evalguard.yaml` (EvalGuard's own format)",
   "and run via `pnpm evalguard eval:local`.",
 ].join("\n");
 
@@ -534,7 +534,7 @@ export function registerSetup(program: Command): void {
     .option("--init", "Shorthand for --init-config --init-workflow", false)
     .action((opts: { agent?: string; dryRun?: boolean; uninstall?: boolean; initConfig?: boolean; initWorkflow?: boolean; init?: boolean }) => {
       const selected = resolveSelected(opts.agent);
-      const apiKey = process.env.EVALGUARD_API_KEY ?? null;
+      const apiKey = resolveApiKey() ?? null;
 
       if (selected.length === 0) {
         console.log(chalk.yellow("No matching agents detected or selected."));

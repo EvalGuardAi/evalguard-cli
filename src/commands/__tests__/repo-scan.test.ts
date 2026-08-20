@@ -52,12 +52,24 @@ describe("matchesIgnore — glob matching", () => {
  * function lets the assertion logic stay simple.
  */
 
-// The first executeRepoScan invocation in a freshly-forked Node
-// process pays a one-time cold-import of @evalguard/core (which is a
-// large package). Under the parallel test-file load that happens
-// during the full CLI suite run, that import can run past the 5s
-// default vitest timeout. Bump per-test timeout to 30s for this
-// describe block — comfortably above the cold-import worst case.
+// The first executeRepoScan invocation in a freshly-forked Node process pays
+// a one-time cold-import of @evalguard/core (a large barrel). A per-test
+// `{ timeout: 30_000 }` used to absorb that, with a comment calling 30s
+// "comfortably above the cold-import worst case" — it is not. Measured on a
+// loaded box (six concurrent workspace test runs) the cold import lands
+// between 12s and 100s and the FIRST test in this block flaked at exactly
+// 30 045 ms while the other eight passed in single-digit ms. A per-test budget
+// cannot cover a per-FORK cost.
+//
+// That was first fixed by moving the import into `beforeAll` with a 600 000 ms
+// budget. This is the same fix taken one step further, matching 055821495 and
+// the sibling files in this package: a top-level `await import` runs in the
+// file's IMPORT phase, which vitest bills against NO budget at all — so there
+// is no longer a number here for a slow box to beat. It must be top-level
+// `await import` and not a static import, because vitest hoists `vi.mock`
+// above static imports.
+await import("@evalguard/core");
+
 describe("executeRepoScan — baseline-pinning soundness", () => {
   let tmpRoot: string;
 
@@ -79,7 +91,7 @@ describe("executeRepoScan — baseline-pinning soundness", () => {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  it("auto-loads .evalguard-scan-ignore by default — masks the malicious file", { timeout: 30_000 }, async () => {
+  it("auto-loads .evalguard-scan-ignore by default — masks the malicious file", async () => {
     const result = await executeRepoScan({
       rootAbs: tmpRoot,
       failOn: "high",
@@ -91,7 +103,7 @@ describe("executeRepoScan — baseline-pinning soundness", () => {
     expect(result.flagged).toBe(0);
   });
 
-  it("with conventionalIgnore=false, the malicious file IS surfaced as a finding", { timeout: 30_000 }, async () => {
+  it("with conventionalIgnore=false, the malicious file IS surfaced as a finding", async () => {
     const result = await executeRepoScan({
       rootAbs: tmpRoot,
       failOn: "high",
@@ -104,7 +116,7 @@ describe("executeRepoScan — baseline-pinning soundness", () => {
     expect(result.exitCode).toBe(1);
   });
 
-  it("explicit ignoreFile path (baseline) uses that file, not the working-tree one", { timeout: 30_000 }, async () => {
+  it("explicit ignoreFile path (baseline) uses that file, not the working-tree one", async () => {
     // Write a BASELINE ignore file in a separate tmp location that
     // does NOT mask the malicious file — simulating "baseline from
     // origin/main where the entry doesn't yet exist".

@@ -39,6 +39,7 @@ import { registerCache } from "../commands/cache";
 import { registerBudget } from "../commands/budget";
 import { registerKeys } from "../commands/keys";
 import { registerSiem } from "../commands/siem";
+import { jsonResponse } from "./helpers/response-double.js";
 
 function findOption(cmd: Command, flag: string): boolean {
   return cmd.options.some((o) => o.long === flag || o.short === flag);
@@ -170,20 +171,19 @@ describe("budget clear subcommand", () => {
     // up on anything else so a stray DELETE during dry-run is obvious.
     const fetchSpy = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
       if (!init || (init.method ?? "GET").toUpperCase() === "GET") {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({
-            data: {
-              keyId: "00000000-0000-4000-8000-000000000001",
-              monthlyBudgetUsd: 100,
-              currentPeriodSpentUsd: 12.34,
-              currentPeriodStartedAt: "2026-05-01T00:00:00.000Z",
-              remainingUsd: 87.66,
-              percentUsed: 12.34,
-            },
-          }),
-        } as unknown as Response;
+        // Real Response: the CLI decodes bodies via `res.text()` at its shared
+        // fail-closed boundary (lib/http.ts), which a `.json()`-only double lacks.
+        return jsonResponse({
+          success: true,
+          data: {
+            keyId: "00000000-0000-4000-8000-000000000001",
+            monthlyBudgetUsd: 100,
+            currentPeriodSpentUsd: 12.34,
+            currentPeriodStartedAt: "2026-05-01T00:00:00.000Z",
+            remainingUsd: 87.66,
+            percentUsed: 12.34,
+          },
+        });
       }
       throw new Error(`unexpected ${init.method} request during dry-run`);
     });
@@ -248,24 +248,20 @@ describe("keys remove subcommand", () => {
 
     const fetchSpy = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
       if (!init || (init.method ?? "GET").toUpperCase() === "GET") {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({
-            success: true,
-            data: {
-              key: {
-                id: "k1",
-                provider: "openai",
-                project_id: null,
-                label: "prod",
-                key_last4: "abcd",
-                created_at: "2026-01-01T00:00:00.000Z",
-                rotated_at: null,
-              },
+        return jsonResponse({
+          success: true,
+          data: {
+            key: {
+              id: "k1",
+              provider: "openai",
+              project_id: null,
+              label: "prod",
+              key_last4: "abcd",
+              created_at: "2026-01-01T00:00:00.000Z",
+              rotated_at: null,
             },
-          }),
-        } as unknown as Response;
+          },
+        });
       }
       throw new Error(`unexpected ${init.method} request during dry-run`);
     });
@@ -345,23 +341,19 @@ describe("siem tokens revoke subcommand", () => {
 
     const fetchSpy = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
       if (!init || (init.method ?? "GET").toUpperCase() === "GET") {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({
-            success: true,
-            data: {
-              token: {
-                id: "t1",
-                source: "splunk",
-                label: "prod",
-                allowed_actions: ["quarantine_key"],
-                revoked: false,
-                last_used_at: null,
-              },
+        return jsonResponse({
+          success: true,
+          data: {
+            token: {
+              id: "t1",
+              source: "splunk",
+              label: "prod",
+              allowed_actions: ["quarantine_key"],
+              revoked: false,
+              last_used_at: null,
             },
-          }),
-        } as unknown as Response;
+          },
+        });
       }
       throw new Error(`unexpected ${init.method} request during dry-run`);
     });

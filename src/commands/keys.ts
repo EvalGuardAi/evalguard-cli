@@ -15,6 +15,7 @@ import chalk from "chalk";
 import * as fs from "fs";
 import { createInterface } from "readline";
 import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody } from "../lib/http.js";
 
 interface ProviderKey {
   id: string;
@@ -63,7 +64,7 @@ async function readPlaintextFromStdin(): Promise<string> {
 }
 
 async function apiFetch(path: string, init: RequestInit = {}): Promise<unknown> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${apiKey()}`,
@@ -71,7 +72,7 @@ async function apiFetch(path: string, init: RequestInit = {}): Promise<unknown> 
       ...(init.headers ?? {}),
     },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } })?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);

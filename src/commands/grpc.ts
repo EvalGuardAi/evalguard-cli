@@ -8,17 +8,19 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody } from "../lib/http.js";
 
 function baseUrl(): string {
   // Default to the prod gRPC root — strip the trailing /v1 if present
   // since gRPC routes live at /api/grpc, not /api/v1/grpc.
-  const base = process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  const base = resolveBaseUrl();
   return base.replace(/\/v1\/?$/, "");
 }
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) {
-    console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`."));
+    console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard login`."));
     process.exit(1);
   }
   return k;
@@ -26,7 +28,7 @@ function apiKey(): string {
 
 async function connectCall(method: string, body: Record<string, unknown> = {}): Promise<unknown> {
   const url = `${baseUrl()}/grpc/evalguard.gateway.v1.GatewayService/${method}`;
-  const res = await fetch(url, {
+  const res = await boundedFetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey()}`,
@@ -35,7 +37,7 @@ async function connectCall(method: string, body: Record<string, unknown> = {}): 
     },
     body: JSON.stringify(body),
   });
-  const parsed = await res.json().catch(() => null);
+  const parsed = await decodeJsonBody(res, "grpc");
   if (!res.ok) {
     const errBody = parsed as { code?: string; message?: string } | null;
     throw new Error(`${errBody?.code ?? `HTTP ${res.status}`}: ${errBody?.message ?? "unknown"}`);

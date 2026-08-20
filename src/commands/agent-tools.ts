@@ -15,6 +15,16 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { failExit } from "../lib/poll.js";
+import {
+  boundedFetch,
+  decodeJsonBody,
+  expectArrayField,
+  expectBooleanField,
+  expectResult,
+  unwrapApiEnvelope,
+} from "../lib/http.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -73,7 +83,7 @@ export interface AgentToolsApiOpts {
 }
 
 async function call(path: string, init: RequestInit, opts: AgentToolsApiOpts): Promise<unknown> {
-  const f = opts.fetchImpl ?? fetch;
+  const f = opts.fetchImpl ?? boundedFetch;
   const res = await f(`${opts.baseUrl}${path}`, {
     ...init,
     headers: {
@@ -82,7 +92,7 @@ async function call(path: string, init: RequestInit, opts: AgentToolsApiOpts): P
       ...(init.headers ?? {}),
     },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } } | null)?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
@@ -137,12 +147,12 @@ export async function testAgentTool(
 }
 
 function envConfig(): AgentToolsApiOpts {
-  const apiKey = process.env.EVALGUARD_API_KEY;
+  const apiKey = resolveApiKey();
   if (!apiKey) {
     console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`."));
     process.exit(1);
   }
-  return { baseUrl: process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1", apiKey };
+  return { baseUrl: resolveBaseUrl(), apiKey };
 }
 
 /** Read+parse a JSON file, or exit(1) with a readable message (mirrors `datasets health`). */
@@ -254,10 +264,14 @@ export function registerAgentTools(program: Command): void {
     .option("--json", "Output as JSON", false)
     .action(async (opts: { project: string; json?: boolean }) => {
       try {
-        const body = (await listAgentTools({ projectId: opts.project, ...envConfig() })) as {
-          data?: { tools?: AgentTool[] };
-        };
-        const tools = body.data?.tools ?? [];
+        const body = await listAgentTools({ projectId: opts.project, ...envConfig() });
+        // `body.data?.tools ?? []` rendered a 200 carrying `{"hello":"world"}`
+        // as "No agent tools yet." with exit 0 — measured 2026-08-08.
+        const tools = expectArrayField(
+          unwrapApiEnvelope(body, "GET /agent-tools"),
+          "tools",
+          "GET /agent-tools",
+        ) as AgentTool[];
         if (opts.json) {
           console.log(JSON.stringify(tools, null, 2));
           return;
@@ -274,8 +288,8 @@ export function registerAgentTools(program: Command): void {
         }
         console.log();
       } catch (e) {
-        console.error(chalk.red(`agent-tools list failed: ${e instanceof Error ? e.message : String(e)}`));
-        process.exit(1);
+        failExit(chalk.red(`agent-tools list failed: ${e instanceof Error ? e.message : String(e)}`));
+        return;
       }
     });
 
@@ -317,12 +331,13 @@ export function registerAgentTools(program: Command): void {
           } else {
             tool = buildAgentToolFromFlags(opts);
           }
-          const body = (await createAgentTool({
-            projectId: opts.project,
-            tool,
-            ...envConfig(),
-          })) as { data?: AgentTool };
-          const created = body.data ?? (body as unknown as AgentTool);
+          // "✓ Created agent tool undefined" was the measured output when the
+          // POST answered 2xx with something that was not the created tool.
+          const created = expectResult<AgentTool>(
+            await createAgentTool({ projectId: opts.project, tool, ...envConfig() }),
+            "POST /agent-tools",
+            ["id", "name"],
+          );
           if (opts.json) {
             console.log(JSON.stringify(created, null, 2));
             return;
@@ -344,8 +359,16 @@ export function registerAgentTools(program: Command): void {
     .option("--json", "Output as JSON", false)
     .action(async (id: string, opts: { project: string; json?: boolean }) => {
       try {
-        const body = (await getAgentTool({ projectId: opts.project, id, ...envConfig() })) as { data?: AgentTool };
-        const tool = body.data ?? (body as unknown as AgentTool);
+        // `body.data ?? (body as unknown as AgentTool)` printed a complete but
+        // EMPTY tool card — "undefined" name, no parameters, no endpoint — with
+        // exit 0, for `{"hello":"world"}`, `{"success":true,"data":null}`,
+        // `{"success":true,"data":{}}` and a 200-with-`success:false`. `id` and
+        // `name` are the minimum that makes a body this route's answer.
+        const tool = expectResult<AgentTool>(
+          await getAgentTool({ projectId: opts.project, id, ...envConfig() }),
+          "GET /agent-tools/:id",
+          ["id", "name"],
+        );
         if (opts.json) {
           console.log(JSON.stringify(tool, null, 2));
           return;
@@ -389,15 +412,23 @@ export function registerAgentTools(program: Command): void {
     .action(async (id: string, opts: { project: string; args: string; json?: boolean }) => {
       try {
         const toolArgs = await parseToolArgs(opts.args);
-        const body = (await testAgentTool({
-          projectId: opts.project,
-          id,
-          toolArgs,
-          ...envConfig(),
-        })) as { data?: AgentToolTestResult };
-        const result = body.data ?? (body as unknown as AgentToolTestResult);
+        // `ok` is the tool-test VERDICT and gates the exit code below, so an
+        // absent one must refuse rather than be spent as a falsy "FAILED" —
+        // "the tool test failed" and "the server did not answer" are different
+        // facts and a CI job acts on them differently.
+        const result = expectResult<AgentToolTestResult>(
+          await testAgentTool({ projectId: opts.project, id, toolArgs, ...envConfig() }),
+          "POST /agent-tools/:id/test",
+          ["ok"],
+        );
+        expectBooleanField(result, "ok", "POST /agent-tools/:id/test");
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
+          // Gate the MACHINE path too (audit 2026-08-09: cli-json-branch-skips-exit-gate).
+          // This `return` jumped the `if (!result.ok) process.exit(1)` below, so the
+          // one mode a CI job actually uses — `--json` — reported a FAILED tool test
+          // as success while the human mode exited 1 for the identical result.
+          if (!result.ok) process.exit(1);
           return;
         }
         const ok = result.ok ? chalk.green("● OK") : chalk.red("● FAILED");

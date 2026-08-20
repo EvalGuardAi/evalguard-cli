@@ -14,18 +14,36 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody, expectResult } from "../lib/http.js";
+import { parseUuidArg } from "../lib/arg-validate.js";
+
+/** Every budget subcommand takes the same positional, so it gets the same check. */
+const KEY_ID_CONSEQUENCE =
+  "The id is interpolated straight into `/api-keys/<id>/budget`, so the request would have gone " +
+  "out and come back 404 — and `budget set` / `budget clear` are WRITES.";
+
+const keyIdArg = (raw: string): string => parseUuidArg(raw, "API key id", KEY_ID_CONSEQUENCE);
 
 type ResetPeriod = "daily" | "weekly" | "monthly";
 
+/**
+ * The budget view as the ROUTE actually sends it.
+ *
+ * `remainingUsd` / `percentUsed` / `currentPeriodStartedAt` / `keyId` were all
+ * declared non-optional here, which is why `tsc` was perfectly happy with
+ * `v.remainingUsd.toFixed(4)` and the TypeError only showed up at runtime. They
+ * are derived / conditional columns; typing them as optional is what makes the
+ * compiler enforce the null-guards rather than the reviewer.
+ */
 interface BudgetView {
-  keyId: string;
+  keyId?: string;
   name?: string;
   monthlyBudgetUsd: number | null;
   resetPeriod?: ResetPeriod;
   currentPeriodSpentUsd: number;
-  currentPeriodStartedAt: string;
-  remainingUsd: number | null;
-  percentUsed: number | null;
+  currentPeriodStartedAt?: string;
+  remainingUsd?: number | null;
+  percentUsed?: number | null;
   staleReset?: boolean;
 }
 
@@ -46,8 +64,26 @@ function apiKey(): string {
   return k;
 }
 
-async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+/**
+ * Decode + unwrap + REQUIRE the fields the caller is about to render.
+ *
+ * The body used to end `return (body as { data: T }).data` — a cast, not a
+ * check, so a 200 carrying `{"success":true,"data":{}}` produced an object whose
+ * every field was `undefined`. Measured on the built CLI:
+ *
+ *     $ evalguard budget limits <keyId> --tpm 10
+ *       ✓ updated limits for undefined
+ *     $ echo $?
+ *     0
+ *
+ * — a WRITE command reporting a successful update of a key it could not name.
+ */
+async function apiFetch<T>(
+  path: string,
+  init: RequestInit = {},
+  required: readonly string[] = [],
+): Promise<T> {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${apiKey()}`,
@@ -55,21 +91,46 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
       ...(init.headers ?? {}),
     },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } })?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
   }
-  return (body as { data: T }).data;
+  return expectResult<T>(body, path, required);
+}
+
+/** The BudgetView fields `renderView` reads unconditionally (two are .toFixed'd). */
+const BUDGET_FIELDS = ["monthlyBudgetUsd", "currentPeriodSpentUsd"] as const;
+
+/** `apiFetch<BudgetView>` with that contract applied — used by every budget read/write. */
+const apiFetchBudget = (path: string, init: RequestInit = {}): Promise<BudgetView> =>
+  apiFetch<BudgetView>(path, init, BUDGET_FIELDS);
+
+/**
+ * Format a USD amount that the server may legitimately omit.
+ *
+ * `remainingUsd` and `percentUsed` are DERIVED columns — the route computes
+ * them only when a cap exists — so a perfectly valid 200 can arrive without
+ * them. The guards here were `=== null`, and `undefined === null` is false, so
+ * an absent field fell through to `undefined.toFixed(4)`:
+ *
+ *     TypeError: Cannot read properties of undefined (reading 'toFixed')
+ *         at renderView (…/dist/commands/budget.js:…)
+ *
+ * — an unhandled stack, not a refusal. `== null` catches both, which is the
+ * whole fix; `BUDGET_FIELDS` already guarantees the two fields the renderer
+ * genuinely cannot do without.
+ */
+function fmtUsd(value: number | null | undefined, digits: number): string {
+  return value == null ? chalk.dim("—") : `$${value.toFixed(digits)}`;
 }
 
 function renderView(v: BudgetView): void {
-  const cap = v.monthlyBudgetUsd === null ? chalk.dim("unlimited") : `$${v.monthlyBudgetUsd.toFixed(2)}`;
-  const spent = `$${v.currentPeriodSpentUsd.toFixed(4)}`;
-  const remaining =
-    v.remainingUsd === null ? chalk.dim("—") : `$${v.remainingUsd.toFixed(4)}`;
+  const cap = fmtUsd(v.monthlyBudgetUsd, 2);
+  const spent = fmtUsd(v.currentPeriodSpentUsd, 4);
+  const remaining = fmtUsd(v.remainingUsd, 4);
   const pctStr =
-    v.percentUsed === null
+    v.percentUsed == null
       ? chalk.dim("—")
       : v.percentUsed >= 100
       ? chalk.red(`${v.percentUsed.toFixed(1)}%`)
@@ -78,14 +139,16 @@ function renderView(v: BudgetView): void {
       : chalk.green(`${v.percentUsed.toFixed(1)}%`);
 
   console.log();
-  console.log(`  ${chalk.bold(v.name ?? v.keyId)}`);
-  console.log(`  ${chalk.dim("Key")}       ${v.keyId}`);
+  // `?? "—"` rather than `??` alone: `name` and `keyId` are both optional on a
+  // real 200, and `chalk.bold(undefined)` prints the literal word "undefined".
+  console.log(`  ${chalk.bold(v.name ?? v.keyId ?? "—")}`);
+  console.log(`  ${chalk.dim("Key")}       ${v.keyId ?? chalk.dim("—")}`);
   console.log(`  ${chalk.dim("Cap")}       ${cap}`);
   console.log(`  ${chalk.dim("Cadence")}   ${v.resetPeriod ?? "monthly"}`);
   console.log(`  ${chalk.dim("Spent")}     ${spent}`);
   console.log(`  ${chalk.dim("Remaining")} ${remaining}`);
   console.log(`  ${chalk.dim("Usage")}     ${pctStr}`);
-  console.log(`  ${chalk.dim("Period")}    ${v.currentPeriodStartedAt}`);
+  console.log(`  ${chalk.dim("Period")}    ${v.currentPeriodStartedAt ?? chalk.dim("—")}`);
   if (v.staleReset) console.log(chalk.yellow("  (period rollover pending — counter resets on next gateway request)"));
   console.log();
 }
@@ -100,8 +163,9 @@ export function registerBudget(program: Command): void {
     .description("Show current spend + cap + percent-used for an API key")
     .argument("<keyId>", "API key UUID")
     .option("--json", "Output as JSON", false)
-    .action(async (keyId: string, opts: { json?: boolean }) => {
-      const v = await apiFetch<BudgetView>(`/api-keys/${keyId}/budget`);
+    .action(async (rawKeyId: string, opts: { json?: boolean }) => {
+      const keyId = keyIdArg(rawKeyId);
+      const v = await apiFetchBudget(`/api-keys/${keyId}/budget`);
       if (opts.json) {
         console.log(JSON.stringify(v, null, 2));
         return;
@@ -118,7 +182,8 @@ export function registerBudget(program: Command): void {
       "--reset-period <cadence>",
       "Reset cadence: daily | weekly | monthly (default monthly)",
     )
-    .action(async (keyId: string, usd: string, opts: { resetPeriod?: string }) => {
+    .action(async (rawKeyId: string, usd: string, opts: { resetPeriod?: string }) => {
+      const keyId = keyIdArg(rawKeyId);
       const n = parseFloat(usd);
       if (!Number.isFinite(n) || n < 0) {
         console.error(chalk.red("Amount must be a non-negative number (or 'clear' to remove cap)."));
@@ -132,7 +197,7 @@ export function registerBudget(program: Command): void {
         }
         payload.resetPeriod = opts.resetPeriod as ResetPeriod;
       }
-      const v = await apiFetch<BudgetView>(`/api-keys/${keyId}/budget`, {
+      const v = await apiFetchBudget(`/api-keys/${keyId}/budget`, {
         method: "PATCH",
         body: JSON.stringify(payload),
       });
@@ -145,12 +210,13 @@ export function registerBudget(program: Command): void {
     .description("Set the spend-cap reset cadence for an API key (daily | weekly | monthly)")
     .argument("<keyId>", "API key UUID")
     .argument("<cadence>", "daily | weekly | monthly")
-    .action(async (keyId: string, cadence: string) => {
+    .action(async (rawKeyId: string, cadence: string) => {
+      const keyId = keyIdArg(rawKeyId);
       if (!["daily", "weekly", "monthly"].includes(cadence)) {
         console.error(chalk.red("Cadence must be one of: daily, weekly, monthly"));
         process.exit(1);
       }
-      const v = await apiFetch<BudgetView>(`/api-keys/${keyId}/budget`, {
+      const v = await apiFetchBudget(`/api-keys/${keyId}/budget`, {
         method: "PATCH",
         body: JSON.stringify({ resetPeriod: cadence }),
       });
@@ -175,7 +241,7 @@ export function registerBudget(program: Command): void {
     .option("--clear-models", "Remove the model allow-list (allow all models)", false)
     .action(
       async (
-        keyId: string,
+        rawKeyId: string,
         opts: {
           tpm?: string;
           rpm?: string;
@@ -184,6 +250,7 @@ export function registerBudget(program: Command): void {
           clearModels?: boolean;
         },
       ) => {
+        const keyId = keyIdArg(rawKeyId);
         // Translate a numeric flag → number | null (0 clears). Reject non-numeric.
         const num = (raw: string | undefined, label: string): number | null | undefined => {
           if (raw === undefined) return undefined; // leave untouched
@@ -227,10 +294,11 @@ export function registerBudget(program: Command): void {
           rpmLimit: number | null;
           maxParallel: number | null;
           modelAllowlist: string[] | null;
-        }>(`/api-keys/${keyId}`, {
-          method: "PATCH",
-          body: JSON.stringify(payload),
-        });
+        }>(
+          `/api-keys/${keyId}`,
+          { method: "PATCH", body: JSON.stringify(payload) },
+          ["id", "name"],
+        );
 
         console.log(chalk.green(`✓ updated limits for ${v.name}`));
         const fmt = (n: number | null) => (n === null ? chalk.dim("unlimited") : String(n));
@@ -252,13 +320,14 @@ export function registerBudget(program: Command): void {
     .description("Remove the monthly cap (unlimited spend on this key)")
     .argument("<keyId>", "API key UUID")
     .option("--dry-run", "Show the current cap that would be removed without changing it", false)
-    .action(async (keyId: string, opts: { dryRun?: boolean }) => {
+    .action(async (rawKeyId: string, opts: { dryRun?: boolean }) => {
+      const keyId = keyIdArg(rawKeyId);
       // E2 (2026-05-19): removing a spend cap is destructive — the key
       // becomes uncapped and a buggy or compromised caller could burn
       // through any amount before someone notices. --dry-run lets ops
       // verify the current cap before tearing it down.
       if (opts.dryRun) {
-        const current = await apiFetch<BudgetView>(`/api-keys/${keyId}/budget`);
+        const current = await apiFetchBudget(`/api-keys/${keyId}/budget`);
         const cap = current.monthlyBudgetUsd === null
           ? chalk.dim("already unlimited")
           : `$${current.monthlyBudgetUsd.toFixed(2)}`;
@@ -271,7 +340,7 @@ export function registerBudget(program: Command): void {
         console.log();
         return;
       }
-      await apiFetch<BudgetView>(`/api-keys/${keyId}/budget`, { method: "DELETE" });
+      await apiFetchBudget(`/api-keys/${keyId}/budget`, { method: "DELETE" });
       console.log(chalk.green(`✓ cap removed — ${keyId} is now unlimited`));
     });
 }

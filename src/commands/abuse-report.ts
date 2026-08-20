@@ -15,6 +15,15 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { failExit } from "../lib/poll.js";
+import {
+  boundedFetch,
+  decodeJsonBody,
+  expectArrayField,
+  expectResult,
+  unwrapApiEnvelope,
+} from "../lib/http.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -50,7 +59,7 @@ export interface AbuseReportsApiOpts {
 }
 
 async function call(path: string, init: RequestInit, opts: AbuseReportsApiOpts): Promise<unknown> {
-  const f = opts.fetchImpl ?? fetch;
+  const f = opts.fetchImpl ?? boundedFetch;
   const res = await f(`${opts.baseUrl}${path}`, {
     ...init,
     headers: {
@@ -59,7 +68,7 @@ async function call(path: string, init: RequestInit, opts: AbuseReportsApiOpts):
       ...(init.headers ?? {}),
     },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } } | null)?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
@@ -99,12 +108,12 @@ export async function fileAbuseReport(
 }
 
 function envConfig(): AbuseReportsApiOpts {
-  const apiKey = process.env.EVALGUARD_API_KEY;
+  const apiKey = resolveApiKey();
   if (!apiKey) {
     console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`."));
     process.exit(1);
   }
-  return { baseUrl: process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1", apiKey };
+  return { baseUrl: resolveBaseUrl(), apiKey };
 }
 
 /** Parse the `--evidence` value: inline JSON, or `@path` to a JSON file. */
@@ -172,7 +181,7 @@ export function registerAbuseReport(program: Command): void {
             process.exit(1);
           }
           const evidence = opts.evidence !== undefined ? await parseEvidence(opts.evidence) : undefined;
-          const body = (await fileAbuseReport({
+          const body = await fileAbuseReport({
             projectId: opts.project,
             category: opts.category as AbuseCategory,
             description: opts.description,
@@ -180,8 +189,14 @@ export function registerAbuseReport(program: Command): void {
             reporterId: opts.reporter,
             evidence,
             ...envConfig(),
-          })) as { data?: { report?: Record<string, unknown>; triage?: AbuseTriage } };
-          const data = body.data ?? (body as { report?: Record<string, unknown>; triage?: AbuseTriage });
+          });
+          // "✓ Filed abuse report" is a claim that a record now exists; without
+          // `report` in the response there is no evidence one does.
+          const data = expectResult<{ report?: Record<string, unknown>; triage?: AbuseTriage }>(
+            body,
+            "POST /abuse-report",
+            ["report"],
+          );
           if (opts.json) {
             console.log(JSON.stringify(data, null, 2));
             return;
@@ -220,15 +235,21 @@ export function registerAbuseReport(program: Command): void {
     .action(async (opts: { project: string; status?: string; json?: boolean }) => {
       try {
         if (opts.status && !ABUSE_STATUSES.includes(opts.status as AbuseStatus)) {
-          console.error(chalk.red(`Unknown status: ${opts.status}. Choose: ${ABUSE_STATUSES.join(" | ")}`));
-          process.exit(1);
+          failExit(chalk.red(`Unknown status: ${opts.status}. Choose: ${ABUSE_STATUSES.join(" | ")}`));
+          return;
         }
-        const body = (await listAbuseReports({
+        const body = await listAbuseReports({
           projectId: opts.project,
           status: opts.status as AbuseStatus | undefined,
           ...envConfig(),
-        })) as { data?: { reports?: Array<Record<string, unknown>> } };
-        const reports = body.data?.reports ?? [];
+        });
+        // `body.data?.reports ?? []` rendered an unrecognised 200 as "no abuse
+        // reports" and exited 0.
+        const reports = expectArrayField(
+          unwrapApiEnvelope(body, "GET /abuse-reports"),
+          "reports",
+          "GET /abuse-reports",
+        ) as Array<Record<string, unknown>>;
         if (opts.json) {
           console.log(JSON.stringify(reports, null, 2));
           return;
@@ -248,8 +269,8 @@ export function registerAbuseReport(program: Command): void {
         }
         console.log();
       } catch (e) {
-        console.error(chalk.red(`abuse-report list failed: ${e instanceof Error ? e.message : String(e)}`));
-        process.exit(1);
+        failExit(chalk.red(`abuse-report list failed: ${e instanceof Error ? e.message : String(e)}`));
+        return;
       }
     });
 }

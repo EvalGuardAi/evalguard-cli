@@ -14,11 +14,57 @@ import * as path from "path";
 
 // ─── Assertion type mapping ───
 //
-// Every promptfoo assertion type we've seen across their docs + sample
-// configs. When extending: if the new assertion has a 1:1 EvalGuard
-// scorer, map to it. If it's promptfoo-only (e.g. `python` arbitrary
-// script), leave OUT of the map so the unmapped-suggestion table can
-// recommend the next-best EvalGuard equivalent.
+// KEY   = a Promptfoo assertion `type`.
+// VALUE = an EvalGuard scorer key.
+//
+// When extending: if the new assertion has a 1:1 EvalGuard scorer, map to it.
+// If it's promptfoo-only (e.g. `python` arbitrary script), leave OUT of the map
+// so the unmapped-suggestion table can recommend the next-best equivalent.
+//
+// ── BOTH SIDES ARE CHECKED AGAINST THE OTHER PROJECT'S SOURCE (2026-08-10) ──
+//
+// This table used to be "every promptfoo assertion type we've seen across their
+// docs + sample configs". Seen-in-docs is not a vocabulary: four of the 27 keys
+// were strings Promptfoo has never accepted, and two of the values named a
+// scorer EvalGuard does not have. Neither side crashes — a dead key is simply
+// never looked up, and a bad value is written into the generated config and only
+// surfaces later as `eval:local`'s "Unknown scorers" — so the whole class was
+// invisible. Re-derived mechanically:
+//
+//   KEYS   vs `BaseAssertionTypesSchema` (66 types) + the generated `not-<base>`
+//          forms + `SpecialAssertionTypes`, in promptfoo's src/types/index.ts
+//          @ db03327 (v0.121.17).
+//   VALUES vs `Object.keys(BUILT_IN_SCORERS)` (245) in the COMPILED
+//          packages/core/dist — the artifact that actually resolves at runtime.
+//
+// Fixed here:
+//   `model-graded-fact` → `model-graded-factuality`  their enum has
+//        `factuality`, `model-graded-factuality` and `model-graded-closedqa`;
+//        never `model-graded-fact`. Both of the first two hit `handleFactuality`
+//        on their side, so both map to our `factuality`.
+//   `rouge`            → `rouge-n`                   they only ever named it
+//        `rouge-n`. The old key shadowed nothing and the real type fell through.
+//   `regex`            → value was "regex"           the registry key is
+//        `regex-match` (`regex` is ABSENT from the 245). This one hit every user
+//        who wrote the single most common promptfoo assertion there is.
+//   `is-valid-openai-function-call` → value was "function-call-valid"
+//        the registry key is `is-valid-function-call`. Promptfoo routes its own
+//        `is-valid-function-call` to the same handler, so that type is mapped
+//        here too rather than being silently dropped.
+//
+// DELIBERATELY NOT promptfoo types, and not a defect — do not "clean up":
+// `ends-with`, `toxicity` and `bias` are identity pass-throughs to real
+// EvalGuard scorers. Promptfoo documents that it has no `ends-with` assertion
+// (use `regex` with a `$` anchor), and its `toxicity`/`bias` are RED-TEAM PLUGIN
+// ids, not assertion types. They are kept so a hand-written or already-migrated
+// EvalGuard config carrying those names still resolves; removing them would make
+// `convertPromptfooConfig` drop the assertion instead.
+//
+// COVERAGE, stated rather than implied: 29 of Promptfoo's 66 base types are
+// named here or in ASSERTION_SUGGESTIONS. The other 37 are dropped on import and
+// reported in `unmappedAssertions` — that is a real gap, not a claim of parity.
+// (It read 26 before the repair above: two of the keys covered nothing because
+// they were not types. The gate for this number is in the importer's tests.)
 
 export const ASSERTION_MAP: Record<string, string> = {
   contains: "contains",
@@ -29,12 +75,13 @@ export const ASSERTION_MAP: Record<string, string> = {
   equals: "equals",
   "starts-with": "starts-with",
   "ends-with": "ends-with",
-  regex: "regex",
+  regex: "regex-match",
   "is-json": "json-valid",
-  "is-valid-openai-function-call": "function-call-valid",
+  "is-valid-function-call": "is-valid-function-call",
+  "is-valid-openai-function-call": "is-valid-function-call",
   "llm-rubric": "llm-grader",
   "model-graded-closedqa": "llm-grader",
-  "model-graded-fact": "factuality",
+  "model-graded-factuality": "factuality",
   factuality: "factuality",
   "answer-relevance": "answer-relevance",
   "context-faithfulness": "context-faithfulness",
@@ -45,6 +92,17 @@ export const ASSERTION_MAP: Record<string, string> = {
   toxicity: "toxicity",
   bias: "bias",
   "is-refusal": "is-refusal",
+  // Reference-overlap + external-webhook metrics that DO have a 1:1 built-in
+  // scorer in @evalguard/core — verified against the registry keys in
+  // packages/core/src/scorers/registry.ts (`bleu`, `rouge-n`, `webhook`). Map
+  // them so a customer's `bleu`/`rouge-n`/`webhook` assertion migrates instead
+  // of being mis-flagged as "no EvalGuard equivalent". (promptfoo's `webhook`
+  // assertion carries the URL in `value`; the EvalGuard `webhook` scorer reads
+  // it from `options.url`, so the migrated entry keeps the value for the user
+  // to move — but the scorer itself genuinely exists.)
+  bleu: "bleu",
+  "rouge-n": "rouge-n",
+  webhook: "webhook",
 };
 
 // Recommendations for promptfoo assertion types that DON'T have a clean
@@ -55,9 +113,6 @@ export const ASSERTION_SUGGESTIONS: Record<string, string> = {
   // thing is to write a custom scorer in your evalguard.config.json.
   javascript: "Custom scorer required — see /docs/scorers/custom",
   python: "Custom scorer required — see /docs/scorers/custom",
-  webhook: "Use the EvalGuard `webhook` post-eval action instead",
-  rouge: "Use `semantic-similarity` (closer match) or `embedding-similarity`",
-  bleu: "Use `semantic-similarity`",
   "perplexity-score": "EvalGuard scores via deep-grader rubric instead — see `judge`",
   classifier: "Use one of the deep-grader scorers (e.g. `bias`, `toxicity`)",
   moderation: "Use `toxicity` + `pii_leak` deep graders combined",
@@ -128,6 +183,21 @@ export interface EvalGuardScorer {
  * registry). The caller is responsible for surfacing those via the
  * `unmappedAssertions` field on the conversion result.
  */
+/**
+ * Whether a promptfoo assertion `type` resolves to a real EvalGuard scorer via
+ * {@link ASSERTION_MAP} — directly, or as a `not-<known>` negation of one.
+ *
+ * Unknown types (`javascript`/`python`/…) return false: they're surfaced in the
+ * unmapped report with a suggestion rather than written as a bogus `scorer:` the
+ * registry has no entry for (which would later trip `validate`/`eval:local`'s
+ * "Unknown scorers"), and they must NOT be counted in the "mapped" total.
+ */
+export function isMappedAssertion(type: string): boolean {
+  if (ASSERTION_MAP[type]) return true;
+  const base = type.startsWith("not-") ? type.replace(/^not-/, "") : type;
+  return Boolean(ASSERTION_MAP[base]);
+}
+
 export function mapAssertion(assertion: Record<string, unknown>): EvalGuardScorer | null {
   const type = assertion.type as string;
   if (!type) return null;
@@ -184,17 +254,23 @@ export function convertPromptfooConfig(
   // ── Prompts ──
   const prompts = (source.prompts ?? []) as string[];
 
-  // ── Default assertions ──
+  // ── Default assertions ── only truly-mapped types become scorers. Unknown
+  // types (javascript/python/…) are collected in `unmappedAssertions` below with
+  // a suggestion instead of being written as a bogus `scorer:` name (which would
+  // later trip "Unknown scorers") — and so they don't inflate the mapped count.
   const defaultTest = source.defaultTest as Record<string, unknown> | undefined;
   const defaultScorers: EvalGuardScorer[] = [];
   if (defaultTest?.assert) {
     for (const a of defaultTest.assert as Record<string, unknown>[]) {
+      const type = a.type as string | undefined;
+      if (!type || !isMappedAssertion(type)) continue;
       const mapped = mapAssertion(a);
       if (mapped) defaultScorers.push(mapped);
     }
   }
 
-  // ── Test cases ──
+  // ── Test cases ── same rule per case: emit only mapped scorers; drop the
+  // `scorers:` key entirely when a case has none that map.
   const rawTests = (source.tests ?? []) as Record<string, unknown>[];
   const cases = rawTests.map((test) => {
     const testCase: Record<string, unknown> = {};
@@ -203,9 +279,11 @@ export function convertPromptfooConfig(
 
     const assertions = test.assert as Record<string, unknown>[] | undefined;
     if (assertions) {
-      testCase.scorers = assertions
+      const mappedScorers = assertions
+        .filter((a) => typeof a.type === "string" && isMappedAssertion(a.type as string))
         .map(mapAssertion)
         .filter((s): s is EvalGuardScorer => s !== null);
+      if (mappedScorers.length > 0) testCase.scorers = mappedScorers;
     }
     return testCase;
   });
@@ -219,10 +297,7 @@ export function convertPromptfooConfig(
   for (const a of allAssertions) {
     const type = a.type as string | undefined;
     if (!type) continue;
-    const baseType = type.startsWith("not-") ? type.replace(/^not-/, "") : type;
-    if (!ASSERTION_MAP[type] && !ASSERTION_MAP[baseType]) {
-      unmappedSet.add(type);
-    }
+    if (!isMappedAssertion(type)) unmappedSet.add(type);
   }
 
   const config: ConversionResult["config"] = {
@@ -244,27 +319,54 @@ export function convertPromptfooConfig(
 
 // ─── YAML parsing ────────────────────────────────────────────────────
 
-async function loadYaml(filePath: string): Promise<Record<string, unknown>> {
+type YamlParse = (s: string) => unknown;
+
+/**
+ * Load a promptfoo config from disk as JSON or YAML.
+ *
+ * The two failure modes are kept DISTINCT: only a genuinely-missing `yaml`
+ * module produces the "install the 'yaml' package" hint. When `yaml` IS present
+ * but the file is malformed, the real `YAMLParseError` (with line/column) is
+ * surfaced — previously an inner catch swallowed it and every parse error was
+ * misreported as "install the package" even though the package was installed.
+ *
+ * Exported so the loader's error contract can be unit-tested without the CLI's
+ * IO/`process.exit` wrapper.
+ */
+export async function loadYaml(filePath: string): Promise<Record<string, unknown>> {
   const content = fs.readFileSync(filePath, "utf-8");
 
   // Try JSON first (promptfooconfig.json is a common alternative).
   try {
-    return JSON.parse(content);
+    return JSON.parse(content) as Record<string, unknown>;
   } catch {
-    // Dynamically import the YAML parser. Falls back to throwing a
-    // helpful error if the `yaml` package isn't installed.
-    try {
-      const yamlMod = await import("yaml");
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const parse = (yamlMod as any).parse ?? (yamlMod as any).default?.parse;
-      if (parse) return parse(content) as Record<string, unknown>;
-    } catch {
-      // Fall through
-    }
-    throw new Error(
-      "YAML parsing requires the 'yaml' package. Install it with: npm install yaml\n" +
-      "Alternatively, convert your promptfooconfig.yaml to JSON first.",
-    );
+    // Not JSON — parse as YAML below.
+  }
+
+  // Dynamically import the YAML parser. ONLY a missing module warrants the
+  // install hint.
+  const installHint =
+    "YAML parsing requires the 'yaml' package. Install it with: npm install yaml\n" +
+    "Alternatively, convert your promptfooconfig.yaml to JSON first.";
+  let parse: YamlParse | undefined;
+  try {
+    const yamlMod = await import("yaml");
+    parse =
+      (yamlMod as { parse?: YamlParse }).parse ??
+      (yamlMod as { default?: { parse?: YamlParse } }).default?.parse;
+  } catch {
+    throw new Error(installHint);
+  }
+  if (typeof parse !== "function") {
+    throw new Error(installHint);
+  }
+
+  // `yaml` IS present — a throw here is a genuinely malformed file. Surface the
+  // real parser error (line/column) instead of the install hint.
+  try {
+    return parse(content) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(`Invalid YAML: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -331,17 +433,33 @@ export function registerImportPromptfoo(program: Command): void {
         return;
       }
 
-      // ── Write output ──
+      // ── Write output ── honor the extension: .yaml/.yml → YAML, else JSON.
       const outputPath = path.resolve(opts.output);
-      fs.writeFileSync(outputPath, JSON.stringify(result.config, null, 2), "utf-8");
+      let serialized: string;
+      if (/\.ya?ml$/i.test(outputPath)) {
+        const yamlMod = await import("yaml");
+        const stringify =
+          (yamlMod as { stringify?: (v: unknown) => string }).stringify ??
+          (yamlMod as { default?: { stringify?: (v: unknown) => string } }).default?.stringify;
+        if (!stringify) throw new Error("YAML serialization requires the 'yaml' package.");
+        serialized = stringify(result.config);
+      } else {
+        serialized = JSON.stringify(result.config, null, 2);
+      }
+      fs.writeFileSync(outputPath, serialized, "utf-8");
 
       console.log();
       console.log(`  ${chalk.green("✓")} Written to ${chalk.cyan(opts.output)}`);
       console.log();
       console.log(chalk.bold("  Next steps:"));
       console.log(`    1. Review ${chalk.cyan(opts.output)}`);
-      console.log(`    2. Run: ${chalk.cyan("npx evalguard eval " + opts.output)}`);
-      console.log(`    3. Try: ${chalk.cyan("npx evalguard scan")} for 249+ red team attacks`);
+      // Run LOCALLY by default: `eval:local` is the keyless local runner and
+      // reads the converted providers/prompts/defaultScorers shape directly.
+      // Plain `eval` is server-backed and fails keyless with "Could not resolve
+      // a default project", so point the cloud path at `eval --project <id>`.
+      console.log(`    2. Run locally (no API key): ${chalk.cyan("npx @evalguard/cli eval:local " + opts.output)}`);
+      console.log(`       Or run in the cloud:     ${chalk.cyan("npx @evalguard/cli eval --project <id> " + opts.output)}`);
+      console.log(`    3. Try: ${chalk.cyan("npx @evalguard/cli scan")} for 300+ red team attacks`);
       console.log();
       console.log(chalk.dim("  Migration guide: https://evalguard.ai/docs/migrating-from-promptfoo"));
       console.log();

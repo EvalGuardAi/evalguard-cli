@@ -15,6 +15,15 @@ import { registerValidate } from "../validate.js";
 
 vi.mock("fs");
 
+// Import-phase warm-up. `await import()` inside a test body is billed against
+// `testTimeout`, and this file reaches `@evalguard/core` lazily, so the first
+// case to touch it paid for the whole 2,173-file graph — ~5 s idle, and past
+// the budget under the pre-push sweep. Loading it here moves that cost into
+// the file's import phase, which vitest bills against no per-test budget.
+// Must be top-level `await import`, not a static import: vitest hoists
+// `vi.mock` above static imports. Full rationale: src/__tests__/cli-smoke.test.ts
+await import("@evalguard/core");
+
 describe("validate accepts redteam.plugins scan configs (cli-validate-rejects-redteam-template)", () => {
   let exitSpy: ReturnType<typeof vi.spyOn>;
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -44,9 +53,7 @@ describe("validate accepts redteam.plugins scan configs (cli-validate-rejects-re
     await program.parseAsync(["node", "evalguard", "validate", "evalguard.yaml"]);
   }
 
-  // `validate` dynamically `import()`s @evalguard/core; under the full
-  // parallel suite that first-load can exceed the 5s default.
-  it("accepts the security-scan template (redteam.plugins) as a valid scan", { timeout: 30_000 }, async () => {
+  it("accepts the security-scan template (redteam.plugins) as a valid scan", async () => {
     await runValidate(
       [
         "description: Security scan for prompt injection",
@@ -70,7 +77,7 @@ describe("validate accepts redteam.plugins scan configs (cli-validate-rejects-re
     expect(exitSpy).toHaveBeenCalledWith(0);
   });
 
-  it("reports an unknown plugin inside redteam.plugins as a scan error", { timeout: 30_000 }, async () => {
+  it("reports an unknown plugin inside redteam.plugins as a scan error", async () => {
     await runValidate(
       [
         "prompts:",

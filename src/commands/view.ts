@@ -9,11 +9,13 @@ import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { exec } from "node:child_process";
 import { listRuns, getRun, type StoredRun } from "./store.js";
 
 // ─── HTML Template ──────────────────────────────────────────────────────────
 
-function buildHTML(): string {
+/** Exported for the XSS regression test (see __tests__/view-xss.test.ts). */
+export function buildHTML(): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -393,7 +395,7 @@ function buildHTML(): string {
         '<div class="empty">' +
           '<div class="empty-icon">&#x1F50D;</div>' +
           '<div class="empty-title">No runs found</div>' +
-          '<div class="empty-hint">Run an eval first: <code>npx evalguard eval --local</code></div>' +
+          '<div class="empty-hint">Run an eval first: <code>npx @evalguard/cli eval --local</code></div>' +
         '</div>';
       return;
     }
@@ -405,9 +407,9 @@ function buildHTML(): string {
       const d = new Date(r.timestamp);
       const dateStr = d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
       const sel = r.id === selectedRunId ? ' selected' : '';
-      return '<div class="run-row' + sel + '" data-id="' + r.id + '">' +
+      return '<div class="run-row' + sel + '" data-id="' + escAttr(r.id) + '">' +
         '<div class="run-icon ' + iconClass + '">' + iconChar + '</div>' +
-        '<div class="run-name">' + esc(r.name) + ' <span class="badge type">' + r.type + '</span></div>' +
+        '<div class="run-name">' + esc(r.name) + ' <span class="badge type">' + esc(r.type) + '</span></div>' +
         '<div class="run-rate" style="color:var(--' + rc + ')">' + (r.passRate * 100).toFixed(1) + '%</div>' +
         '<div class="run-counts">' + r.passed + '/' + r.total + '</div>' +
         '<div class="run-model">' + esc(r.model) + '</div>' +
@@ -443,7 +445,7 @@ function buildHTML(): string {
           '<span>' + esc(run.model) + '</span>' +
           '<span>' + esc(run.provider) + '</span>' +
           '<span>' + d.toLocaleString() + '</span>' +
-          '<span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">' + run.id + '</span>' +
+          '<span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">' + esc(run.id) + '</span>' +
         '</div></div>' +
         '<span class="badge ' + badgeClass + '">' + (run.passRate * 100).toFixed(1) + '% pass</span>' +
       '</div>';
@@ -494,10 +496,22 @@ function buildHTML(): string {
     '</div>';
   }
 
+  /* XSS (audit 2026-07-25 MEDIUM): every value that reaches innerHTML must be
+     escaped. esc() is for TEXT positions; it leaves quotes intact, so it is
+     NOT safe inside an attribute value. escAttr() additionally escapes both
+     quote characters, which is what the run id needs - the id comes from an
+     evalguard-results.json file in the current working directory, i.e. from
+     whatever repo the developer just cloned, and a value ending in a double
+     quote used to break out of data-id="..." and add an event-handler
+     attribute that runs attacker JS with access to this page. */
   function esc(s) {
     const d = document.createElement('div');
-    d.textContent = s;
+    d.textContent = s == null ? '' : String(s);
     return d.innerHTML;
+  }
+
+  function escAttr(s) {
+    return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   function render() {
@@ -617,7 +631,12 @@ function startServer(port: number): http.Server {
 // ─── Browser opener ─────────────────────────────────────────────────────────
 
 function openBrowser(url: string): void {
-  const { exec } = require("child_process") as typeof import("child_process");
+  // `exec` is imported statically at the top of this module. It used to be
+  // pulled in with a bare `require("child_process")` — but apps/cli is
+  // "type": "module" built by plain tsc, so `require` does not exist here and
+  // this line threw `ReferenceError: require is not defined` every time,
+  // making `evalguard view` unable to open a browser. Same defect class as
+  // audit F109 in @evalguard/otel-sdk.
   const platform = process.platform;
 
   let cmd: string;

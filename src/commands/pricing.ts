@@ -54,6 +54,10 @@ export function registerPricing(program: Command): void {
       );
       if (opts.json) {
         console.log(JSON.stringify(Object.fromEntries(filtered), null, 2));
+        // Same gate as the text path below (audit 2026-08-09:
+        // cli-json-branch-skips-exit-gate) — `--json` printed `{}` and exited 0
+        // for a provider filter that matched nothing, while the text path exits 1.
+        if (filtered.length === 0) process.exit(1);
         return;
       }
       if (filtered.length === 0) {
@@ -145,6 +149,10 @@ export function registerPricing(program: Command): void {
       const stale = findStalePricing(new Date(), opts.maxAgeMonths);
       if (opts.json) {
         console.log(JSON.stringify({ thresholdMonths: opts.maxAgeMonths, stale }, null, 2));
+        // `pricing stale --json` IS the CI form of this check, and it was the one
+        // that could not fail (audit 2026-08-09: cli-json-branch-skips-exit-gate).
+        // The text path exits 1 on the same input via the gate below.
+        if (stale.length > 0) process.exit(1);
         return;
       }
       if (stale.length === 0) {

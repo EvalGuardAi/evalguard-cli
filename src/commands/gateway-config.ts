@@ -20,6 +20,7 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody, expectResult } from "../lib/http.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -55,17 +56,34 @@ function apiKey(): string {
   return k;
 }
 
-async function unwrap<T>(res: Response, label: string): Promise<T> {
-  const json = (await res.json().catch(() => ({}))) as {
-    data?: T;
+/**
+ * Decode + REQUIRE the fields this command is about to render.
+ *
+ * The body used to end `return (json.data ?? (json as unknown as T)) as T`,
+ * which is a cast, not a check. Measured on the built CLI, `gateway-config get`
+ * printed a complete, plausible configuration —
+ *
+ *     Strategy:  priority
+ *     Cache:     off (ttl 0s, exact)
+ *     Rate cap:  off (0 req/min, 0 tok/min)
+ *
+ * — with exit 0, for `{"hello":"world"}`, `{"success":true,"data":null}`,
+ * `{"success":true,"data":{}}` AND for an explicit `{"success":false,"error":…}`
+ * arriving with a 200. Every value on screen came from the `??` defaults in the
+ * renderer, so an operator reading it would conclude the gateway is on
+ * `priority` with caching off. Those defaults are only safe once the object is
+ * known to be the route's answer, which is what `required` establishes.
+ */
+async function unwrap<T>(res: Response, label: string, required: readonly string[]): Promise<T> {
+  const json = (await decodeJsonBody(res, "gateway-config")) as {
     error?: { message?: string; code?: string };
-  };
+  } | null;
   if (!res.ok) {
     throw new Error(
-      `${label} failed: HTTP ${res.status} (${json.error?.code ?? "ERROR"}: ${json.error?.message ?? "unknown"})`,
+      `${label} failed: HTTP ${res.status} (${json?.error?.code ?? "ERROR"}: ${json?.error?.message ?? "unknown"})`,
     );
   }
-  return (json.data ?? (json as unknown as T)) as T;
+  return expectResult<T>(json, "gateway-config", required);
 }
 
 export interface GatewayConfigView {
@@ -83,12 +101,13 @@ export async function fetchGatewayConfig(opts: {
   apiKey: string;
   fetchImpl?: typeof fetch;
 }): Promise<GatewayConfigView> {
-  const fetchFn = opts.fetchImpl ?? fetch;
+  const fetchFn = opts.fetchImpl ?? boundedFetch;
   const res = await fetchFn(`${opts.baseUrl}/gateway`, {
     method: "GET",
     headers: { authorization: `Bearer ${opts.apiKey}` },
   });
-  return unwrap<GatewayConfigView>(res, "Gateway config get");
+  // `routing` is the block whose `strategy` is the headline line of the output.
+  return unwrap<GatewayConfigView>(res, "Gateway config get", ["routing"]);
 }
 
 export interface GatewayConfigUpdate {
@@ -134,13 +153,15 @@ export async function setGatewayConfig(opts: {
     throw new Error("Nothing to set — pass at least one of --strategy / --enable / --disable / --enable-cache / --disable-cache / --cache-ttl");
   }
 
-  const fetchFn = opts.fetchImpl ?? fetch;
+  const fetchFn = opts.fetchImpl ?? boundedFetch;
   const res = await fetchFn(`${opts.baseUrl}/gateway`, {
     method: "PUT",
     headers: { authorization: `Bearer ${opts.apiKey}`, "content-type": "application/json" },
     body: JSON.stringify(u),
   });
-  return unwrap<GatewayConfigSetResult>(res, "Gateway config set");
+  // The PUT echoes back what it stored; without `routingStrategy` there is no
+  // evidence the write took effect, and "✓ updated" would be unfounded.
+  return unwrap<GatewayConfigSetResult>(res, "Gateway config set", ["routingStrategy"]);
 }
 
 export function registerGatewayConfig(program: Command): void {
@@ -168,7 +189,9 @@ export function registerGatewayConfig(program: Command): void {
       console.log(chalk.bold.cyan("  EvalGuard") + chalk.dim(" — gateway routing config"));
       console.log(chalk.dim("  ─────────────────────────────────────────────"));
       console.log();
-      console.log(`  Strategy:  ${chalk.bold(config.routing?.strategy ?? "priority")}`);
+      // No `?? "priority"`: `unwrap` proved `routing` came from the server, so a
+      // missing strategy is a real gap and is shown as one rather than invented.
+      console.log(`  Strategy:  ${chalk.bold(config.routing?.strategy ?? chalk.yellow("(not reported by the server)"))}`);
       if (config.routing?.availableStrategies?.length) {
         console.log(chalk.dim(`             available: ${config.routing.availableStrategies.join(", ")}`));
       }

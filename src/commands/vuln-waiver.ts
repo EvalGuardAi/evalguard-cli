@@ -1,5 +1,5 @@
 /**
- * `evalguard vuln-waiver …` — manage per-CVE waivers (G2). snyk `.snyk`-style:
+ * `evalguard vuln-waiver …` — manage per-CVE waivers (G2). Waiver-file model:
  * waive a specific (CVE, package) tuple so it stops failing the supply-chain CI
  * gate while the finding stays VISIBLE in scan output. A waiver carries a reason
  * (audit) and an optional expiry (the CVE re-surfaces once the waiver lapses).
@@ -15,13 +15,21 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { failExit } from "../lib/poll.js";
+import {
+  boundedFetch,
+  decodeJsonBody,
+  expectArrayField,
+  unwrapApiEnvelope,
+} from "../lib/http.js";
 
 function baseUrl(): string {
-  return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  return resolveBaseUrl();
 }
 
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) {
     console.error(chalk.red("EVALGUARD_API_KEY is not set. Run `evalguard login --key <key>` first."));
     process.exit(1);
@@ -44,21 +52,28 @@ interface WaiverRecord {
 }
 
 async function apiFetch<T>(path: string, method: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     method,
     headers: { "content-type": "application/json", authorization: `Bearer ${apiKey()}` },
     body: body ? JSON.stringify(body) : undefined,
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`request failed (${res.status}): ${text.slice(0, 300)}`);
-  const json = text ? JSON.parse(text) : {};
-  return (json.data ?? json) as T;
+  // FAIL CLOSED via the shared boundary. This used to hand-roll
+  // `res.text()` + `JSON.parse` + `json.data ?? json`, which passes an unrelated
+  // 200 straight through to the renderer and treats a `success:false` envelope
+  // as a result. See lib/http.ts, and the sbom-monitor note for the measured
+  // case where the same shape rendered an empty body as "nothing configured".
+  const decoded = await decodeJsonBody(res, path);
+  if (!res.ok) {
+    const detail = (decoded as { error?: { message?: string } } | null)?.error?.message;
+    throw new Error(`request failed (${res.status})${detail ? `: ${detail}` : ""}`);
+  }
+  return unwrapApiEnvelope(decoded, path) as T;
 }
 
 export function registerVulnWaiver(program: Command): void {
   const cmd = program
     .command("vuln-waiver")
-    .description("Manage per-CVE waivers for the supply-chain CI gate (snyk .snyk-style)");
+    .description("Manage per-CVE waivers for the supply-chain CI gate");
 
   cmd
     .command("add")
@@ -100,10 +115,19 @@ export function registerVulnWaiver(program: Command): void {
     .option("--json", "output raw JSON")
     .action(async (opts: { project: string; json?: boolean }) => {
       try {
-        const result = await apiFetch<{ waivers: WaiverRecord[]; total: number }>(
+        const raw = await apiFetch<unknown>(
           `/supply-chain/waivers?projectId=${encodeURIComponent(opts.project)}`,
           "GET",
         );
+        // `result.waivers.length` on a body without `waivers` threw a raw
+        // `Cannot read properties of undefined (reading 'length')` at the user.
+        // It exited non-zero, so it was not a fail-OPEN — but "the response was
+        // not this endpoint's answer" is the actual fact, and that is what the
+        // operator needs to read in a CI log.
+        const result = {
+          waivers: expectArrayField(raw, "waivers", "GET /supply-chain/waivers") as WaiverRecord[],
+          total: (raw as { total?: number })?.total ?? 0,
+        };
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
           return;
@@ -125,8 +149,8 @@ export function registerVulnWaiver(program: Command): void {
         }
         console.log(chalk.dim(`\n${result.total} waiver${result.total === 1 ? "" : "s"}`));
       } catch (err) {
-        console.error(chalk.red("✗ ") + (err as Error).message);
-        process.exit(1);
+        failExit(chalk.red("✗ ") + (err as Error).message);
+        return;
       }
     });
 

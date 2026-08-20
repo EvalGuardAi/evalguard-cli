@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { jsonResponse } from "../../__tests__/helpers/response-double.js";
 import { moderateImage, moderateVideo, detectDeepfake } from "../moderation.js";
 
 const ORG = "00000000-0000-4000-8000-0000000000aa";
@@ -8,7 +9,9 @@ const OPTS = { baseUrl: "https://x.test/api/v1", apiKey: "k" };
 function okFetch(data: unknown) {
   return vi.fn(
     async (_url: string, _init?: RequestInit) =>
-      ({ ok: true, status: 200, json: async () => ({ success: true, data }) }) as unknown as Response,
+      // Real Response: the CLI decodes bodies via `res.text()` at the shared
+      // fail-closed boundary (lib/http.ts), which a `.json()`-only double lacks.
+      jsonResponse({ success: true, data }),
   );
 }
 
@@ -50,7 +53,7 @@ describe("moderation CLI API client", () => {
   it("surfaces a non-OK API error message", async () => {
     const f = vi.fn(
       async () =>
-        ({ ok: false, status: 400, json: async () => ({ error: { message: "PROVIDER_KEY_UNAVAILABLE" } }) }) as unknown as Response,
+        jsonResponse({ error: { message: "PROVIDER_KEY_UNAVAILABLE" } }, 400),
     );
     await expect(
       moderateImage({ orgId: ORG, projectId: PROJECT, imageUrl: "https://x/y.png", ...OPTS, fetchImpl: f as unknown as typeof fetch }),

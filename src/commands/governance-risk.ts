@@ -12,12 +12,15 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { parseGateThreshold } from "../lib/gate-threshold.js";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody, unwrapApiEnvelope } from "../lib/http.js";
 
 function baseUrl(): string {
-  return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  return resolveBaseUrl();
 }
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) {
     console.error(chalk.red("EVALGUARD_API_KEY is not set. Run `evalguard login --key <key>` first."));
     process.exit(1);
@@ -61,16 +64,23 @@ export async function fetchGovernanceRiskCli(opts: {
   apiKey: string;
   fetchImpl?: typeof fetch;
 }): Promise<GovernanceRiskCliResult> {
-  const fetchFn = opts.fetchImpl ?? fetch;
+  const fetchFn = opts.fetchImpl ?? boundedFetch;
   const res = await fetchFn(`${opts.baseUrl}/governance/risk`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${opts.apiKey}` },
     body: JSON.stringify(opts.body),
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`governance-risk failed (${res.status}): ${text.slice(0, 300)}`);
-  const json = JSON.parse(text);
-  return (json.data ?? json) as GovernanceRiskCliResult;
+  // FAIL CLOSED via the shared boundary. This used to hand-roll
+  // `res.text()` + `JSON.parse` + `json.data ?? json`, which passes an unrelated
+  // 200 straight through to the renderer and treats a `success:false` envelope
+  // as a result. See lib/http.ts, and the sbom-monitor note for the measured
+  // case where the same shape rendered an empty body as "nothing configured".
+  const decoded = await decodeJsonBody(res, "POST /governance/risk");
+  if (!res.ok) {
+    const detail = (decoded as { error?: { message?: string } } | null)?.error?.message;
+    throw new Error(`governance-risk failed (${res.status})${detail ? `: ${detail}` : ""}`);
+  }
+  return unwrapApiEnvelope(decoded, "POST /governance/risk") as GovernanceRiskCliResult;
 }
 
 export function registerGovernanceRisk(program: Command): void {
@@ -136,7 +146,10 @@ export function registerGovernanceRisk(program: Command): void {
         for (const rec of result.recommendations) console.log(`    ${chalk.dim("→")} ${rec}`);
       }
 
-      if (options.failAbove !== undefined && result.overallScore > Number(options.failAbove)) {
+      if (
+        options.failAbove !== undefined &&
+        result.overallScore > parseGateThreshold(options.failAbove, "--fail-above", { min: 0, max: 100 })
+      ) {
         process.exit(1);
       }
     });

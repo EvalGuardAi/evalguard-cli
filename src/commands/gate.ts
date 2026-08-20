@@ -15,6 +15,28 @@ import chalk from "chalk";
 import ora from "ora";
 import * as fs from "fs";
 import * as path from "path";
+// Reuse eval:local's shared config normaliser + per-case-scoped runner so the
+// gate runs the SAME shapes eval:local does — including a converted config
+// (`import:promptfoo`/`import:humanloop` output: providers[]/prompts[]/
+// defaultScorers/per-case scorers). Before this, the gate validated the RAW
+// config against a native-only schema and rejected a converted one with
+// "missing prompt".
+import { normaliseConfig, runScopedEvaluation, type ScopedCase } from "./eval-local.js";
+// Wilson interval + z-table for --significance mode.
+//
+// This is a SUBPATH import on purpose: `evaluateGateDecision` must stay pure and
+// synchronous, and the CLI otherwise loads `@evalguard/core` with a dynamic
+// `await import()` inside the action so the root barrel never enters CLI
+// startup. `@evalguard/core/stats/wilson` is a leaf module with no imports of
+// its own, so importing it at the top level costs nothing measurable and, unlike
+// the hand-copied `wilsonIntervalLocal` this replaced (a THIRD transcription of
+// the same seven lines — the others being leaderboard/ranking.ts and
+// security/adaptive/early-stop.ts), it cannot drift from them.
+import {
+  wilsonInterval,
+  zFor as coreZFor,
+  Z_BY_CONFIDENCE as GATE_Z_BY_CONFIDENCE,
+} from "@evalguard/core/stats/wilson";
 
 interface GateConfig {
   name?: string;
@@ -24,6 +46,17 @@ interface GateConfig {
   scorers: string[];
   cases: unknown[];
   scorerOptions?: unknown;
+}
+
+/**
+ * The eval-result-row fields the gate PRINTS for failed tests. The runner
+ * returns richer rows than {@link ScopedCase} declares (which is intentionally
+ * minimal for per-case scoping); this names the subset the failure list reads.
+ */
+interface GateResultCase {
+  input: string;
+  actualOutput: string;
+  passed: boolean;
 }
 
 /**
@@ -92,6 +125,124 @@ export function resolveGateModel(
   return cliModel ?? configModel ?? GATE_DEFAULT_MODEL;
 }
 
+/* ── Statistical-significance mode (audit #45 / plan D2) ─────────────────── */
+
+/** Nearest supported z for a confidence level (defaults to 95%). */
+export function gateZFor(confidence: number): number {
+  return coreZFor(confidence);
+}
+
+export type GateVerdict = "pass" | "fail" | "inconclusive";
+
+export interface GateDecision {
+  verdict: GateVerdict;
+  /** Whether the process should exit 0. */
+  pass: boolean;
+  passRate: number;
+  /** Wilson interval on the observed pass rate — only set in significance mode. */
+  interval?: [number, number];
+  confidence?: number;
+  /** Human explanation of WHY this verdict was reached. */
+  reason: string;
+}
+
+/**
+ * Decide the gate outcome.
+ *
+ * Default (no `--significance`) is the historical behaviour, byte-for-byte:
+ * `--strict` ⇒ any single failure blocks; otherwise `passRate >= threshold`.
+ *
+ * With `--significance`, the pass rate is treated as what it is — a binomial
+ * ESTIMATE from `total` trials — and a Wilson score interval is computed at the
+ * requested confidence. That distinguishes the two cases a bare threshold
+ * conflates:
+ *
+ *   • the whole interval sits below the threshold  → a real regression (fail);
+ *   • the point estimate is below but the interval still covers the threshold
+ *     → the run is too small to tell (inconclusive).
+ *
+ * Inconclusive FAILS by default — a CI gate must not become more permissive by
+ * default. `--allow-inconclusive` opts a team into "don't block on noise", which
+ * is the whole reason to run 20 cases and not block on a single flake.
+ *
+ * Pure + total: no I/O, no throwing, safe to unit test without an LLM.
+ */
+export function evaluateGateDecision(args: {
+  passed: number;
+  total: number;
+  threshold: number;
+  strict: boolean;
+  significance: boolean;
+  confidence: number;
+  allowInconclusive: boolean;
+}): GateDecision {
+  const { passed, total, threshold, strict, significance, confidence, allowInconclusive } = args;
+  const passRate = total > 0 ? passed / total : 0;
+  const failed = total - passed;
+
+  if (!significance) {
+    const ok = strict ? failed === 0 : passRate >= threshold;
+    return {
+      verdict: ok ? "pass" : "fail",
+      pass: ok,
+      passRate,
+      reason: strict
+        ? `strict mode: ${failed} failing case(s)`
+        : `pass rate ${(passRate * 100).toFixed(1)}% vs threshold ${(threshold * 100).toFixed(0)}%`,
+    };
+  }
+
+  // `--strict` still wins in significance mode: "zero failures" is not a
+  // statistical claim, it is an absolute one, and silently softening it would
+  // be a gate regression.
+  if (strict && failed > 0) {
+    return {
+      verdict: "fail",
+      pass: false,
+      passRate,
+      confidence,
+      reason: `strict mode: ${failed} failing case(s)`,
+    };
+  }
+
+  const z = gateZFor(confidence);
+  const interval = wilsonInterval(passed, total, z);
+  if (passRate >= threshold) {
+    return {
+      verdict: "pass",
+      pass: true,
+      passRate,
+      interval,
+      confidence,
+      reason: `pass rate ${(passRate * 100).toFixed(1)}% meets threshold ${(threshold * 100).toFixed(0)}%`,
+    };
+  }
+  if (interval[1] < threshold) {
+    return {
+      verdict: "fail",
+      pass: false,
+      passRate,
+      interval,
+      confidence,
+      reason:
+        `pass rate ${(passRate * 100).toFixed(1)}% is below threshold ${(threshold * 100).toFixed(0)}% ` +
+        `at ${(confidence * 100).toFixed(0)}% confidence ` +
+        `(interval ${(interval[0] * 100).toFixed(1)}–${(interval[1] * 100).toFixed(1)}%)`,
+    };
+  }
+  return {
+    verdict: "inconclusive",
+    pass: allowInconclusive,
+    passRate,
+    interval,
+    confidence,
+    reason:
+      `pass rate ${(passRate * 100).toFixed(1)}% is below threshold ${(threshold * 100).toFixed(0)}%, but ` +
+      `${total} case(s) cannot distinguish that from noise ` +
+      `(interval ${(interval[0] * 100).toFixed(1)}–${(interval[1] * 100).toFixed(1)}% still covers it)`,
+  };
+}
+
 export function registerGate(program: Command): void {
   program
     .command("gate")
@@ -111,6 +262,12 @@ export function registerGate(program: Command): void {
     .option("-p, --provider <provider>", "Provider override")
     .option("-s, --suite <name>", "Built-in test suite: faithfulness, safety, hallucination, general")
     .option("--strict", "Fail on any single test failure (ignore threshold)", false)
+    // Audit #45 / plan D2 — the statistics engine shipped but the customer-facing
+    // CI gate could not consume it, so a 20-case run at 85% was indistinguishable
+    // from a real regression at 85%.
+    .option("--significance", "Treat the pass rate as a binomial estimate: block only on a statistically-supported regression", false)
+    .option("--confidence <number>", "Confidence level for --significance (0.8, 0.9, 0.95, 0.99)", "0.95")
+    .option("--allow-inconclusive", "With --significance, exit 0 when the run is too small to distinguish a regression from noise", false)
     .option("--json", "Output results as JSON for CI parsing", false)
     .action(async (configArg: string | undefined, opts: {
       threshold: string;
@@ -119,6 +276,9 @@ export function registerGate(program: Command): void {
       provider?: string;
       suite?: string;
       strict: boolean;
+      significance: boolean;
+      confidence: string;
+      allowInconclusive: boolean;
       json: boolean;
     }) => {
       // Resolve the config path: `--config` wins over the positional so an
@@ -131,6 +291,19 @@ export function registerGate(program: Command): void {
       const threshold = parseFloat(opts.threshold);
       if (isNaN(threshold) || threshold < 0 || threshold > 1) {
         console.error(chalk.red(`Invalid threshold: ${opts.threshold}. Must be 0.0-1.0`));
+        process.exit(1);
+      }
+
+      // Fail closed on a bad confidence level rather than silently substituting
+      // 0.95 — a CI gate that quietly ran at a different confidence than the
+      // operator asked for is worse than one that refuses to run.
+      const confidence = parseFloat(opts.confidence);
+      if (opts.significance && !(String(confidence) in GATE_Z_BY_CONFIDENCE)) {
+        console.error(
+          chalk.red(
+            `Invalid confidence: ${opts.confidence}. Supported: ${Object.keys(GATE_Z_BY_CONFIDENCE).join(", ")}`,
+          ),
+        );
         process.exit(1);
       }
 
@@ -168,10 +341,22 @@ export function registerGate(program: Command): void {
           }
         }
 
-        // Validate the resolved config BEFORE dereferencing prompt/cases/scorers.
-        // Fail closed (exit 1) on any schema problem — a gate must never crash
-        // opaquely or run with zero coverage.
-        const validation = validateGateConfig(rawConfig);
+        // Normalise ANY config into the native {model, prompt, scorers[],
+        // cases[]} shape — the SAME path eval:local uses — so a converted config
+        // (providers[]/prompts[]/defaultScorers/per-case scorers) runs, not only
+        // the native {prompt, scorers, cases} shape. A native config / built-in
+        // suite fast-paths through normaliseConfig unchanged. Guard non-objects
+        // (a malformed/empty YAML file parses to null) so validateGateConfig
+        // still returns its precise error instead of a normaliser crash.
+        const normalisedConfig =
+          rawConfig && typeof rawConfig === "object" ? normaliseConfig(rawConfig) : rawConfig;
+
+        // Validate the NORMALISED config BEFORE dereferencing prompt/cases/
+        // scorers. Fail closed (exit 1) on any schema problem — a gate must never
+        // crash opaquely or run with zero coverage. normaliseConfig defaults an
+        // empty config to prompt "{{input}}"/scorers ["contains"] but NOT cases,
+        // so a genuinely empty config still fails here on its zero-case array.
+        const validation = validateGateConfig(normalisedConfig);
         if (!validation.ok) {
           spinner.fail(`Invalid gate config: ${validation.error}`);
           process.exit(1);
@@ -215,13 +400,18 @@ export function registerGate(program: Command): void {
 
         spinner.text = `Running ${config.cases.length} tests on ${model} (threshold: ${(threshold * 100).toFixed(0)}%)...`;
 
-        const result = await runEvaluation({
+        // Run through runScopedEvaluation (same as eval:local) so a converted
+        // config's PER-CASE scorers are scored only against their own case — no
+        // cross-applied phantom failures that would flip the gate's exit code.
+        // A native/suite config (no per-case scorers) takes the single-run fast
+        // path, byte-for-byte identical to the previous direct runEvaluation call.
+        const result = await runScopedEvaluation(runEvaluation, {
           model,
           prompt: config.prompt,
-          cases: config.cases,
+          cases: config.cases as ScopedCase[],
           scorers: config.scorers,
           callLLM,
-          scorerOptions: config.scorerOptions,
+          scorerOptions: config.scorerOptions as Record<string, Record<string, unknown>> | undefined,
         });
 
         spinner.stop();
@@ -238,7 +428,16 @@ export function registerGate(program: Command): void {
         const passed = result.cases.filter((c: any) => c.passed).length;
         const failed = result.cases.length - passed;
         const passRate = result.passRate;
-        const gatePass = opts.strict ? failed === 0 : passRate >= threshold;
+        const decision = evaluateGateDecision({
+          passed,
+          total: result.cases.length,
+          threshold,
+          strict: opts.strict,
+          significance: opts.significance,
+          confidence,
+          allowInconclusive: opts.allowInconclusive,
+        });
+        const gatePass = decision.pass;
 
         // Store results locally
         try {
@@ -258,6 +457,14 @@ export function registerGate(program: Command): void {
           // Machine-readable output for CI
           console.log(JSON.stringify({
             gate: gatePass ? "PASS" : "FAIL",
+            // `verdict` distinguishes a real regression from a run too small to
+            // tell — "FAIL" alone cannot. Always present so a CI script can key
+            // on it without sniffing whether --significance was passed.
+            verdict: decision.verdict,
+            reason: decision.reason,
+            ...(decision.interval
+              ? { confidence: decision.confidence, passRateInterval: decision.interval }
+              : {}),
             threshold,
             passRate,
             passed,
@@ -271,8 +478,14 @@ export function registerGate(program: Command): void {
         } else {
           // Human-readable output
           console.log();
-          if (gatePass) {
+          if (decision.verdict === "pass") {
             console.log(chalk.green.bold("  ✓ GATE PASSED"));
+          } else if (decision.verdict === "inconclusive") {
+            console.log(
+              gatePass
+                ? chalk.yellow.bold("  ~ GATE INCONCLUSIVE — not enough cases to call a regression")
+                : chalk.red.bold("  ✗ GATE FAILED — INCONCLUSIVE (pass --allow-inconclusive to let this through)"),
+            );
           } else {
             console.log(chalk.red.bold("  ✗ GATE FAILED — DEPLOYMENT BLOCKED"));
           }
@@ -280,6 +493,13 @@ export function registerGate(program: Command): void {
           const rateStr = (passRate * 100).toFixed(1) + "%";
           const rateColor = passRate >= threshold ? chalk.green : chalk.red;
           console.log(`  Pass rate: ${rateColor(rateStr)} (threshold: ${(threshold * 100).toFixed(0)}%)`);
+          if (decision.interval) {
+            console.log(
+              `  Interval:  ${(decision.interval[0] * 100).toFixed(1)}–${(decision.interval[1] * 100).toFixed(1)}% ` +
+                chalk.dim(`(Wilson, ${(decision.confidence! * 100).toFixed(0)}% confidence, n=${result.cases.length})`),
+            );
+          }
+          console.log(`  Verdict:   ${decision.reason}`);
           console.log(`  Results:   ${chalk.green(passed + " passed")} / ${chalk.red(failed + " failed")} / ${result.cases.length} total`);
           console.log(`  Score:     ${result.score.toFixed(2)}/${result.maxScore}`);
           console.log(`  Model:     ${model} (${providerName})`);
@@ -288,7 +508,7 @@ export function registerGate(program: Command): void {
 
           if (!gatePass) {
             console.log(chalk.dim("  Failed tests:"));
-            for (const c of result.cases.filter((c: any) => !c.passed)) {
+            for (const c of result.cases.filter((rc) => !rc.passed) as GateResultCase[]) {
               console.log(chalk.red(`    ✗ ${c.input.slice(0, 80)}`));
               console.log(chalk.dim(`      Got: ${c.actualOutput.slice(0, 80)}`));
             }

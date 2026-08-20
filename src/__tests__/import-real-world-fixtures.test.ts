@@ -87,8 +87,10 @@ describe("convertPromptfooConfig — real-world fixture", () => {
     expect(sim).toEqual({ scorer: "semantic-similarity", value: "A beautiful sunny day", threshold: 0.6 });
   });
 
-  it("flags unsupported assertions (javascript, rouge) in unmappedAssertions", () => {
-    expect(result.unmappedAssertions).toEqual(["javascript", "rouge"]);
+  it("flags the still-unsupported assertion (javascript) in unmappedAssertions", () => {
+    // `rouge` used to be flagged too, but it now maps to the built-in `rouge-n`
+    // scorer, so `javascript` is the only assertion left with no equivalent.
+    expect(result.unmappedAssertions).toEqual(["javascript"]);
   });
 
   it("maps is-refusal correctly (built-in promptfoo type)", () => {
@@ -127,21 +129,24 @@ describe("normaliseConfig — real-world promptfoo fixture (eval:local on-ramp)"
     }
   });
 
-  it("does NOT emit promptfoo-only types (javascript/rouge) as bogus scorer names", () => {
+  it("does NOT emit promptfoo-only types (javascript/rouge-n) as bogus scorer names", () => {
     expect(cfg.scorers).not.toContain("javascript");
     expect(cfg.scorers).not.toContain("rouge");
+    expect(cfg.scorers).toContain("rouge-n");
   });
 
   it("surfaces the promptfoo-only types as skippedAssertions with suggestions (warned, not silent)", () => {
     const skipped = cfg.skippedAssertions ?? [];
     const types = skipped.map((s) => s.type).sort();
-    expect(types).toEqual(["javascript", "rouge"]);
+    // `rouge-n` is a real built-in, so `javascript` is the only
+    // genuinely-unrunnable type left to skip.
+    expect(types).toEqual(["javascript"]);
     // Every skipped entry carries a concrete next-step suggestion.
     for (const entry of skipped) {
       expect(entry.suggestion.length).toBeGreaterThan(0);
     }
-    const rouge = skipped.find((s) => s.type === "rouge");
-    expect(rouge?.suggestion).toMatch(/semantic-similarity/);
+    const js = skipped.find((s) => s.type === "javascript");
+    expect(js?.suggestion).toMatch(/custom/i);
   });
 
   it("every mapped standard type resolves to a VALID built-in scorer (no 'Unknown scorers' for them)", () => {
@@ -210,21 +215,21 @@ describe("normaliseConfig — assertion mapping is the single ASSERTION_MAP sour
     expect(cfg.scorers).toEqual(["llm-grader"]);
   });
 
-  it("maps `is-json` → `json-valid` and `model-graded-fact` → `factuality` via the canonical map", () => {
+  it("maps `is-json` → `json-valid` and `model-graded-factuality` → `factuality` via the canonical map", () => {
     const cfg = normaliseConfig({
       providers: ["openai:gpt-4o"],
       prompts: ["{{q}}"],
       tests: [
         {
           vars: { q: "hi" },
-          assert: [{ type: "is-json" }, { type: "model-graded-fact" }],
+          assert: [{ type: "is-json" }, { type: "model-graded-factuality" }],
         },
       ],
     });
     expect(cfg.scorers).toContain("json-valid");
     expect(cfg.scorers).toContain("factuality");
     expect(cfg.scorers).not.toContain("is-json");
-    expect(cfg.scorers).not.toContain("model-graded-fact");
+    expect(cfg.scorers).not.toContain("model-graded-factuality");
   });
 });
 
@@ -285,7 +290,11 @@ describe("convertHumanloopExport — real-world fixture", () => {
   });
 
   it("maps 4 of 6 evaluators (llm, human, factuality, toxicity); flags code + custom as unmapped", () => {
-    expect(result.evaluatorCount).toBe(6);
+    // `evaluatorCount` counts only the truly-mapped evaluators (4), NOT the raw
+    // input count (6) — the code/custom passthroughs are surfaced as unmapped
+    // rather than inflating the "mapped" total or being written as scorers.
+    expect(result.evaluatorCount).toBe(4);
+    expect(result.config.defaultScorers).toHaveLength(4);
     expect(result.unmappedEvaluators).toEqual(["code", "custom"]);
   });
 

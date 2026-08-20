@@ -6,9 +6,13 @@
 //   - Provider dedup wrong → 10 providers for 1 actual model
 
 import { describe, expect, it } from "vitest";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import {
   EVALUATOR_TYPE_MAP,
   convertHumanloopExport,
+  loadHumanloopFile,
   mapHumanloopEvaluator,
   mapHumanloopModelConfig,
 } from "../commands/import-humanloop";
@@ -191,6 +195,25 @@ describe("convertHumanloopExport — full conversion", () => {
     expect(result.unmappedEvaluators).toEqual(["code", "custom"]);
   });
 
+  it("counts + writes ONLY truly-mapped evaluators (no bogus scorer names, no over-count)", () => {
+    const source = {
+      evaluators: [
+        { type: "toxicity", threshold: 0.1 },
+        { type: "code" }, // unknown → must NOT be written or counted
+        { type: "custom" }, // unknown → must NOT be written or counted
+      ],
+    };
+    const result = convertHumanloopExport(source);
+    // Only `toxicity` maps → count 1, and it's the only written scorer.
+    expect(result.evaluatorCount).toBe(1);
+    expect(result.config.defaultScorers).toEqual([{ scorer: "toxicity", threshold: 0.1 }]);
+    // The unknown passthroughs are reported, not silently written as scorers.
+    expect(result.unmappedEvaluators).toEqual(["code", "custom"]);
+    const scorerNames = (result.config.defaultScorers ?? []).map((s) => s.scorer);
+    expect(scorerNames).not.toContain("code");
+    expect(scorerNames).not.toContain("custom");
+  });
+
   it("flattens dataset inputs into cases with description tag", () => {
     const source = {
       datasets: [
@@ -225,5 +248,35 @@ describe("EVALUATOR_TYPE_MAP — coverage floor", () => {
     ]) {
       expect(EVALUATOR_TYPE_MAP[t]).toBeDefined();
     }
+  });
+});
+
+describe("loadHumanloopFile — surfaces the real parse error, not a generic 'could not parse'", () => {
+  // Regression (live E2E 2026-07-16): a malformed export was reported with a
+  // generic "could not parse" that swallowed the real error. With `yaml`
+  // installed, loadHumanloopFile must surface the actual parser error.
+  function writeTmp(name: string, content: string): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "eg-loadhl-"));
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, content, "utf-8");
+    return p;
+  }
+
+  it("parses a JSON export (JSON is tried first)", async () => {
+    const p = writeTmp("export.json", JSON.stringify({ name: "Bot" }));
+    const cfg = await loadHumanloopFile(p);
+    expect(cfg.name).toBe("Bot");
+  });
+
+  it("parses a YAML export", async () => {
+    const p = writeTmp("export.yaml", "name: Bot\nprompts: []\n");
+    const cfg = await loadHumanloopFile(p);
+    expect(cfg.name).toBe("Bot");
+  });
+
+  it("throws the REAL parser error (with detail), NOT a bare 'could not parse'", async () => {
+    const p = writeTmp("bad.yaml", "name:\n  - a\n bad: [oops\nx: : :\n");
+    await expect(loadHumanloopFile(p)).rejects.toThrow(/Invalid Humanloop export/);
+    await expect(loadHumanloopFile(p)).rejects.not.toThrow(/'yaml' package is unavailable/);
   });
 });

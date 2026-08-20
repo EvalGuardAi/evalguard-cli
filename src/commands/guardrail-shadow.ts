@@ -14,6 +14,9 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { failExit } from "../lib/poll.js";
+import { boundedFetch, decodeJsonBody, expectArray, unwrapApiEnvelope } from "../lib/http.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SENS = ["monitor", "balanced", "strict", "lockdown"] as const;
@@ -26,7 +29,7 @@ export interface ShadowApiOpts {
 }
 
 async function call(path: string, init: RequestInit, opts: ShadowApiOpts): Promise<unknown> {
-  const f = opts.fetchImpl ?? fetch;
+  const f = opts.fetchImpl ?? boundedFetch;
   const res = await f(`${opts.baseUrl}${path}`, {
     ...init,
     headers: {
@@ -35,7 +38,7 @@ async function call(path: string, init: RequestInit, opts: ShadowApiOpts): Promi
       ...(init.headers ?? {}),
     },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } } | null)?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
@@ -103,16 +106,20 @@ export async function deleteShadowConfig(
 }
 
 function envConfig(): ShadowApiOpts {
-  const apiKey = process.env.EVALGUARD_API_KEY;
+  const apiKey = resolveApiKey();
   if (!apiKey) {
     console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`."));
     process.exit(1);
   }
-  return { baseUrl: process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1", apiKey };
+  return { baseUrl: resolveBaseUrl(), apiKey };
 }
 
-function unwrap(body: unknown): unknown {
-  return (body as { data?: unknown } | null)?.data ?? body;
+function unwrap(body: unknown, endpoint = "the shadow-guardrail API"): unknown {
+  // Delegates to the shared contract. The previous body was
+  // `(body as {data?})?.data ?? body`, whose `?? body` handed the whole envelope
+  // back when `data` was null and passed an unrelated 200 straight through —
+  // the consumer's `?? []` then rendered it as an empty list, exit 0.
+  return unwrapApiEnvelope(body, endpoint);
 }
 
 function csv(v?: string): string[] | undefined {
@@ -170,7 +177,17 @@ export function registerGuardrailShadow(program: Command): void {
     .option("--json", "Output as JSON", false)
     .action(async (opts: { org: string; project: string; json?: boolean }) => {
       try {
-        const data = unwrap(await listShadowConfigs({ orgId: opts.org, projectId: opts.project, ...envConfig() })) as Array<{
+        // `!Array.isArray(data)` used to fall into the SAME branch as an
+        // empty list, so a 200 carrying an unrelated object printed the empty
+        // state and exited 0 (measured 2026-08-08). expectArray separates
+        // "not a list" from "an empty list"; the latter is still fine.
+        const data = expectArray(
+          unwrap(
+            await listShadowConfigs({ orgId: opts.org, projectId: opts.project, ...envConfig() }),
+            "GET /gateway/guardrails/shadow",
+          ),
+          "GET /gateway/guardrails/shadow",
+        ) as Array<{
           id: string; name: string; enabled: boolean;
           stats?: { total: number; divergenceRate: number; recommendation: string };
         }>;
@@ -182,8 +199,8 @@ export function registerGuardrailShadow(program: Command): void {
           if (c.stats?.recommendation) console.log(`      ${chalk.dim(c.stats.recommendation)}`);
         }
       } catch (e) {
-        console.error(chalk.red(e instanceof Error ? e.message : String(e)));
-        process.exit(1);
+        failExit(chalk.red(e instanceof Error ? e.message : String(e)));
+        return;
       }
     });
 

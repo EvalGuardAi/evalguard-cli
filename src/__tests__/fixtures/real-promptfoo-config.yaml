@@ -1,10 +1,14 @@
-# Real promptfoo config — shape taken verbatim from
-# github.com/promptfoo/promptfoo/tree/main/examples (Tweet sentiment +
-# safety-bench patterns). This fixture exists so the import:promptfoo
-# importer test catches schema-shift regressions: if promptfoo ships a
-# breaking change to their config grammar, this file's exact bytes
-# will start failing the integration test, and the importer can be
-# updated in lockstep.
+# Input fixture for the `import:promptfoo` importer — a full-featured config
+# in that interchange format (tweet-sentiment + safety-bench shape), covering
+# providers with inline config, templated prompts, and per-test assertions.
+# It is pinned byte-for-byte so the importer's integration test fails loudly
+# if the format's grammar shifts, rather than silently importing a subset.
+#
+# `toxicity` / `bias` below are NOT Promptfoo assertion types (theirs are
+# red-team plugin ids); they exercise the importer's deliberate identity
+# pass-through for EvalGuard-native scorer names. Every OTHER `type:` here is a
+# real member of `BaseAssertionTypesSchema` — `rouge` was corrected to `rouge-n`
+# on 2026-08-10, having never been one.
 description: 'Tweet sentiment + safety eval'
 providers:
   - id: openai:gpt-4o
@@ -55,5 +59,5 @@ tests:
     assert:
       - type: javascript
         value: 'output.length < 280'
-      - type: rouge
+      - type: rouge-n
         value: 'reference text'

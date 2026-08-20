@@ -3,11 +3,10 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
 import ora from "ora";
-import path from "node:path";
-import os from "node:os";
-import fs from "node:fs";
 import { getRun } from "./store.js";
+import { boundedFetch, decodeJsonBody } from "../lib/http.js";
 
 export function registerShare(program: Command): void {
   program
@@ -27,15 +26,8 @@ export function registerShare(program: Command): void {
       const spinner = ora("Creating share link...").start();
 
       try {
-        // ESM: use node: imports, not require() (live-E2E 2026-06-16: `evalguard
-        // share` was DOA with "require is not defined" inside this ESM module).
-        const configPath = path.join(os.homedir(), ".evalguard", "config.json");
-        const config = fs.existsSync(configPath)
-          ? JSON.parse(fs.readFileSync(configPath, "utf-8"))
-          : {};
-
-        const baseUrl = process.env.EVALGUARD_BASE_URL ?? config.baseUrl ?? "https://evalguard.ai/api/v1";
-        const apiKey = process.env.EVALGUARD_API_KEY ?? config.apiKey;
+        const baseUrl = resolveBaseUrl();
+        const apiKey = resolveApiKey();
 
         if (!apiKey) {
           spinner.fail("Not authenticated. Run `evalguard login` first.");
@@ -48,7 +40,7 @@ export function registerShare(program: Command): void {
           process.exit(1);
         }
 
-        const res = await fetch(`${baseUrl}/shares`, {
+        const res = await boundedFetch(`${baseUrl}/shares`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -62,7 +54,7 @@ export function registerShare(program: Command): void {
           }),
         });
 
-        const data = (await res.json().catch(() => ({ message: res.statusText }))) as Record<string, unknown>;
+        const data = (await decodeJsonBody(res, "share")) as Record<string, unknown>;
 
         if (!res.ok) {
           throw new Error(`API error ${res.status}: ${data.message ?? "Unknown error"}`);

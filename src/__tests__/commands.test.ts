@@ -15,6 +15,15 @@ import { registerList } from "../commands/list";
 import { registerFirewall } from "../commands/firewall";
 
 // ─── Validate Command Tests ───
+// Import-phase warm-up. `await import()` inside a test body is billed against
+// `testTimeout`, and this file reaches `@evalguard/core` lazily, so the first
+// case to touch it paid for the whole 2,173-file graph — ~5 s idle, and past
+// the budget under the pre-push sweep. Loading it here moves that cost into
+// the file's import phase, which vitest bills against no per-test budget.
+// Must be top-level `await import`, not a static import: vitest hoists
+// `vi.mock` above static imports. Full rationale: src/__tests__/cli-smoke.test.ts
+await import("@evalguard/core");
+
 describe("validate command", () => {
   it("should register the validate command", () => {
     const program = new Command();
@@ -67,7 +76,7 @@ describe("firewall command", () => {
 
 // ─── Validate Logic Tests (using @evalguard/core directly) ───
 describe("validate logic", () => {
-  it("should validate a correct eval config", { timeout: 30_000 }, async () => {
+  it("should validate a correct eval config", async () => {
     const { BUILT_IN_SCORERS } = await import("@evalguard/core");
 
     const config = {
@@ -211,9 +220,9 @@ describe("list logic", () => {
     expect(ALL_STRATEGIES.length).toBeGreaterThanOrEqual(FEATURE_COUNTS.redTeamStrategies);
   });
 
-  it("should have 10 graders available", async () => {
+  it("should have 45 graders available", async () => {
     const { ALL_GRADERS } = await import("@evalguard/core");
-    expect(ALL_GRADERS.length).toBe(30);
+    expect(ALL_GRADERS.length).toBe(45);
   });
 
   it("should have 40 providers available", async () => {

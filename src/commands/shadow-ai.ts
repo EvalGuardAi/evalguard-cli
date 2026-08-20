@@ -7,20 +7,22 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
 import * as fs from "fs";
+import { boundedFetch, decodeJsonBody } from "../lib/http.js";
 
-function baseUrl(): string { return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1"; }
+function baseUrl(): string { return resolveBaseUrl(); }
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) { console.error(chalk.red("EVALGUARD_API_KEY not set.")); process.exit(1); }
   return k;
 }
 async function apiFetch(path: string, init: RequestInit = {}): Promise<unknown> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${apiKey()}`, "content-type": "application/json", ...(init.headers ?? {}) },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } })?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);

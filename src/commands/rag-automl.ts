@@ -20,17 +20,26 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { failExit } from "../lib/poll.js";
 import * as fs from "fs";
 import * as path from "path";
+import {
+  boundedFetch,
+  decodeJsonBody,
+  expectArray,
+  expectResult,
+  unwrapApiEnvelope,
+} from "../lib/http.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function baseUrl(): string {
-  return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  return resolveBaseUrl();
 }
 
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) {
     console.error(
       chalk.red("EVALGUARD_API_KEY is not set. Run `evalguard login` first or export the key."),
@@ -65,17 +74,27 @@ export interface RagAutoMLStudy {
   message?: string;
 }
 
-async function unwrap<T>(res: Response, label: string): Promise<T> {
-  const json = (await res.json().catch(() => ({}))) as {
-    data?: T;
+/** Decode + unwrap the envelope, fail closed. Shape is asserted by the caller. */
+async function unwrapEnvelope(res: Response, label: string): Promise<unknown> {
+  const json = (await decodeJsonBody(res, "rag-automl")) as {
     error?: { message?: string; code?: string };
-  };
+  } | null;
   if (!res.ok) {
     throw new Error(
-      `${label} failed: HTTP ${res.status} (${json.error?.code ?? "ERROR"}: ${json.error?.message ?? "unknown"})`,
+      `${label} failed: HTTP ${res.status} (${json?.error?.code ?? "ERROR"}: ${json?.error?.message ?? "unknown"})`,
     );
   }
-  return (json.data ?? (json as unknown as T)) as T;
+  return unwrapApiEnvelope(json, "rag-automl");
+}
+
+/**
+ * The object-shaped calls. The body used to end
+ * `return (json.data ?? (json as unknown as T)) as T` — a cast, not a check, so
+ * an unrelated 200 and a 200-with-`success:false` both became a "study". See the
+ * "no module CASTS a response envelope" gate in __tests__/http-boundary-gate.
+ */
+async function unwrap<T>(res: Response, label: string, required: readonly string[] = []): Promise<T> {
+  return expectResult<T>(await unwrapEnvelope(res, label), "rag-automl", required);
 }
 
 /** POST a RAG AutoML study config → ranked leaderboard. Pure + testable. */
@@ -89,7 +108,7 @@ export async function runRagAutoMLStudy(opts: {
   if (typeof cfg?.projectId !== "string" || !UUID_RE.test(cfg.projectId)) {
     throw new Error("config.projectId must be a valid project UUID");
   }
-  const fetchFn = opts.fetchImpl ?? fetch;
+  const fetchFn = opts.fetchImpl ?? boundedFetch;
   const res = await fetchFn(`${opts.baseUrl}/experiments/rag-automl`, {
     method: "POST",
     headers: {
@@ -111,12 +130,14 @@ export async function listRagAutoMLStudies(opts: {
   if (!UUID_RE.test(opts.projectId)) {
     throw new Error(`projectId must be a valid UUID. Got: ${opts.projectId}`);
   }
-  const fetchFn = opts.fetchImpl ?? fetch;
+  const fetchFn = opts.fetchImpl ?? boundedFetch;
   const res = await fetchFn(
     `${opts.baseUrl}/experiments/rag-automl?projectId=${encodeURIComponent(opts.projectId)}`,
     { method: "GET", headers: { authorization: `Bearer ${opts.apiKey}` } },
   );
-  return unwrap<unknown[]>(res, "RAG AutoML list");
+  // A LIST endpoint: `expectArray` refuses "the server sent something that is
+  // not a list" instead of rendering it as an empty leaderboard.
+  return expectArray(await unwrapEnvelope(res, "RAG AutoML list"), "GET /experiments/rag-automl");
 }
 
 /** GET one study + its full ranked leaderboard (replay). Pure + testable. */
@@ -130,7 +151,7 @@ export async function getRagAutoMLStudy(opts: {
   if (!UUID_RE.test(opts.projectId)) {
     throw new Error(`projectId must be a valid UUID. Got: ${opts.projectId}`);
   }
-  const fetchFn = opts.fetchImpl ?? fetch;
+  const fetchFn = opts.fetchImpl ?? boundedFetch;
   const params = new URLSearchParams({ projectId: opts.projectId, studyId: opts.studyId });
   const res = await fetchFn(`${opts.baseUrl}/experiments/rag-automl?${params.toString()}`, {
     method: "GET",
@@ -221,8 +242,8 @@ export function registerRagAutoML(program: Command): void {
       try {
         studies = await listRagAutoMLStudies({ projectId: opts.project, baseUrl: baseUrl(), apiKey: apiKey() });
       } catch (err) {
-        console.error(chalk.red(`  ${(err as Error).message}`));
-        process.exit(1);
+        failExit(chalk.red(`  ${(err as Error).message}`));
+        return;
       }
       if (opts.json) {
         console.log(JSON.stringify(studies, null, 2));

@@ -69,8 +69,18 @@ describe("normalizeBaseUrl (cli-login-base-url-missing-api-v1)", () => {
     expect(normalizeBaseUrl("https://evalguard.ai/api/v1/")).toBe("https://evalguard.ai/api/v1");
   });
 
+  // Audit M2 (cli-normalize-base-url-double-api): a base that ends in `/api`
+  // (the documented public base `https://evalguard.ai/api`) used to become
+  // `.../api/api/v1` → 404. It must append only the missing `/v1`.
+  it("appends only /v1 when the URL ends in /api (no /api/api/v1 double-append)", () => {
+    expect(normalizeBaseUrl("https://evalguard.ai/api")).toBe("https://evalguard.ai/api/v1");
+    expect(normalizeBaseUrl("https://evalguard.ai/api/")).toBe("https://evalguard.ai/api/v1");
+    expect(normalizeBaseUrl("https://evalguard.ai/api///")).toBe("https://evalguard.ai/api/v1");
+  });
+
   it("works for custom hosts (self-hosted / local dev)", () => {
     expect(normalizeBaseUrl("http://localhost:3000")).toBe("http://localhost:3000/api/v1");
+    expect(normalizeBaseUrl("http://localhost:3000/api")).toBe("http://localhost:3000/api/v1");
   });
 });
 

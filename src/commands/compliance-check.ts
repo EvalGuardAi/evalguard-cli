@@ -19,6 +19,44 @@ import ora from "ora";
 import * as fs from "fs";
 import * as path from "path";
 import { resolveApiKey as resolveCliApiKey, resolveBaseUrl as resolveCliBaseUrl } from "../lib/config.js";
+import { failSpinner } from "../lib/poll.js";
+import { makeCallLLM, detectProviderFromModel } from "../lib/call-llm.js";
+import { isErroredFinding } from "@evalguard/core";
+import { boundedFetch, decodeJsonBody } from "../lib/http.js";
+
+/** All attack-type names the scanner knows, for the classic-framework path. */
+function ATTACK_TYPE_NAMES(core: Record<string, any>): string[] {
+  return (core.ATTACK_TYPES ?? []).map((a: { type: string }) => a.type);
+}
+
+/**
+ * A scan whose attacks all failed to execute carries NO evidence — the target
+ * model was never successfully contacted.
+ *
+ * `runSecurityScan` records an unreachable target as a finding with
+ * `output: "[ERROR] …"`, `errored: true`, `passed: false`. Both compliance
+ * mappers key requirement status off `passed`, so handing them such a scan
+ * reports confident, fabricated NON-COMPLIANCE (measured: EU AI Act
+ * overallScore 0, 14 requirements not-met, "All N test(s) failed. Immediate
+ * remediation required.") for a model that was never asked a single question.
+ *
+ * Returning null routes the caller to the honest dry-run report, where every
+ * requirement is "untested".
+ *
+ * NOTE (audit A137): this is a CALLER-SIDE convenience, not the fix. It only
+ * covers the ALL-errored case and only in this CLI; the four web routes that
+ * call `GapAnalysis.analyze` had no equivalent, and a PARTIALLY errored scan
+ * still fabricated failures everywhere. `GapAnalysis.analyze` now excludes
+ * errored findings itself. This is kept because "the model was never reached at
+ * all" deserves the explicit dry-run report rather than an all-untested one.
+ * The predicate is the shared `isErroredFinding` — do not re-inline it.
+ */
+export function discardIfAllErrored(scanResults: any): any {
+  const findings = scanResults?.findings;
+  if (!Array.isArray(findings) || findings.length === 0) return scanResults;
+  const errored = findings.filter((f: any) => isErroredFinding(f));
+  return errored.length === findings.length ? null : scanResults;
+}
 
 const SUPPORTED_FRAMEWORKS = [
   "eu-ai-act",
@@ -110,30 +148,180 @@ export function complianceCheckUrl(baseUrl: string): string {
   return `${baseUrl}/compliance/check`;
 }
 
+const DEFAULT_MODEL = "gpt-4o-mini";
+const DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant.";
+
 /**
- * Build the POST body for the remote compliance check. The route's PostBody
- * Zod schema requires `orgId: z.string().uuid()`, so a body without it 400s
- * BEFORE the handler runs — which made `evalguard compliance-check` DOA for
- * every authenticated (API-key) user (audit 2026-06-16, HIGH; the prior test
- * only covered the URL, not the body). Throws a clear, actionable error when
- * orgId is absent. Exported for regression testing.
+ * Environment variable holding the LLM provider credential for `provider`.
+ * Shared by the local and remote paths so they resolve the same key.
  */
-export function complianceCheckPayload(config: ComplianceCheckConfig): {
+export function providerApiKeyEnvVar(provider: string): string {
+  const map: Record<string, string> = {
+    openai: "OPENAI_API_KEY",
+    anthropic: "ANTHROPIC_API_KEY",
+    google: "GOOGLE_API_KEY",
+    mistral: "MISTRAL_API_KEY",
+  };
+  return map[provider] ?? `${provider.toUpperCase()}_API_KEY`;
+}
+
+/**
+ * Build the POST body for the remote compliance check.
+ *
+ * The route's PostBody Zod schema
+ * (apps/web/src/app/api/v1/compliance/check/route.ts) requires SIX fields:
+ * `orgId` (uuid), `framework`, `model`, `provider`, `systemPrompt` and `apiKey`
+ * — all `.min(1)`, none optional. The body only ever carried
+ * `{orgId, framework, model?, systemPrompt?}`, so Zod rejected every request
+ * with 400 VALIDATION_ERROR before the handler ran: `evalguard
+ * compliance-check` was DOA for every authenticated (API-key) user. `model` and
+ * `systemPrompt` were additionally sent as `undefined`, which `JSON.stringify`
+ * DROPS, so even those two were missing whenever the flags were omitted.
+ *
+ * `apiKey` here is the LLM PROVIDER credential the server needs to run the
+ * scan — distinct from the EvalGuard API key in the Authorization header.
+ * Resolved from the same env var the local path uses.
+ *
+ * Throws a clear, actionable error for anything it cannot resolve. Exported for
+ * regression testing.
+ */
+export function complianceCheckPayload(
+  config: ComplianceCheckConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): {
   orgId: string;
   framework: FrameworkId;
-  model?: string;
-  systemPrompt?: string;
+  model: string;
+  provider: string;
+  systemPrompt: string;
+  apiKey: string;
 } {
   if (!config.orgId) {
     throw new Error(
       "orgId is required for the API compliance check. Pass --org <uuid> or set EVALGUARD_ORG_ID.",
     );
   }
+  const model = config.model ?? DEFAULT_MODEL;
+  const provider = config.provider ?? detectProvider(model);
+  const envVar = providerApiKeyEnvVar(provider);
+  const apiKey = env[envVar];
+  if (!apiKey) {
+    throw new Error(
+      `The API compliance check runs the scan against ${provider}, so it needs that ` +
+        `provider's key. Set ${envVar}, or pass --provider <provider> to use a different one.`,
+    );
+  }
   return {
     orgId: config.orgId,
     framework: config.framework,
-    model: config.model,
-    systemPrompt: config.systemPrompt,
+    model,
+    provider,
+    systemPrompt: config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
+    apiKey,
+  };
+}
+
+/** The engine result the route returns, as far as the CLI reads it. */
+interface RemoteCheckResult {
+  framework?: string;
+  frameworkName?: string;
+  version?: string;
+  overallScore?: number;
+  totalRequirements?: number;
+  timestamp?: string;
+  requirementResults?: {
+    requirementId: string;
+    category: string;
+    title: string;
+    status: string;
+    score?: number;
+    findings?: string[];
+    remediation?: string;
+  }[];
+  remediationPlan?: {
+    requirementId: string;
+    priority: string;
+    action: string;
+    effort: string;
+  }[];
+}
+
+/**
+ * Map the route's engine result onto the shape the CLI's renderer expects.
+ *
+ * The route responds `{ success, data: ComplianceCheckResult }` — the CLI cast
+ * the whole envelope straight to its own `ComplianceResult`, so every field the
+ * report prints (overallScore, metCount, byCategory, …) came out `undefined`
+ * and the threshold comparison was `undefined >= 70` → always "FAILED", exit 1.
+ * The engine also names things differently (`requirementResults` vs
+ * `requirements`, `remediationPlan` vs `remediationSteps`) and reports no
+ * per-status counts, so they are derived here. Exported for regression testing.
+ */
+export function normalizeRemoteResult(
+  data: RemoteCheckResult,
+  model: string,
+): ComplianceResult {
+  const results = data.requirementResults ?? [];
+  const severityFor = (requirementId: string): string =>
+    data.remediationPlan?.find((s) => s.requirementId === requirementId)?.priority ?? "medium";
+
+  const requirements: RequirementResult[] = results.map((r) => ({
+    id: r.requirementId,
+    title: r.title,
+    category: r.category,
+    severity: severityFor(r.requirementId),
+    status:
+      r.status === "met" || r.status === "partial" || r.status === "not-met"
+        ? r.status
+        : "untested",
+    notes: r.findings?.length ? r.findings.join("; ") : (r.remediation ?? ""),
+  }));
+
+  const byCategory: ComplianceResult["byCategory"] = {};
+  for (const r of requirements) {
+    const cat = (byCategory[r.category] ??= {
+      name: r.category,
+      total: 0,
+      met: 0,
+      partial: 0,
+      notMet: 0,
+      untested: 0,
+      score: 0,
+    });
+    cat.total++;
+    if (r.status === "met") cat.met++;
+    else if (r.status === "partial") cat.partial++;
+    else if (r.status === "not-met") cat.notMet++;
+    else cat.untested++;
+  }
+  for (const cat of Object.values(byCategory)) {
+    cat.score = cat.total > 0 ? Math.round((cat.met / cat.total) * 100) : 0;
+  }
+
+  return {
+    framework: data.framework ?? "",
+    frameworkName: data.frameworkName ?? data.framework ?? "",
+    version: data.version ?? "unknown",
+    model,
+    timestamp: data.timestamp ?? new Date().toISOString(),
+    overallScore: data.overallScore ?? 0,
+    totalRequirements: data.totalRequirements ?? requirements.length,
+    metCount: requirements.filter((r) => r.status === "met").length,
+    partialCount: requirements.filter((r) => r.status === "partial").length,
+    notMetCount: requirements.filter((r) => r.status === "not-met").length,
+    untestedCount: requirements.filter((r) => r.status === "untested").length,
+    requirements,
+    byCategory,
+    remediationSteps: (data.remediationPlan ?? []).map((s, i) => ({
+      priority: i + 1,
+      requirementId: s.requirementId,
+      requirementTitle:
+        results.find((r) => r.requirementId === s.requirementId)?.title ?? s.requirementId,
+      severity: s.priority,
+      action: s.action,
+      effort: s.effort,
+      automatable: false,
+    })),
   };
 }
 
@@ -149,7 +337,7 @@ async function runRemoteCheck(
   // baseUrl already carries the /api/v1 prefix (env/config/default) — appending
   // another /api/v1 produced /api/v1/api/v1/compliance/check → 404 for every
   // authenticated user (audit: cli-compliance-double-apiv1-prefix).
-  const res = await fetch(complianceCheckUrl(baseUrl), {
+  const res = await boundedFetch(complianceCheckUrl(baseUrl), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -159,13 +347,19 @@ async function runRemoteCheck(
   });
 
   if (!res.ok) {
-    const errBody = await res.json().catch(() => ({ message: res.statusText }));
-    throw new Error(
-      `API error ${res.status}: ${(errBody as Record<string, string>).message ?? "Unknown error"}`,
-    );
+    const errBody = (await decodeJsonBody(res, "compliance-check")) as
+      | { error?: { message?: string; code?: string }; message?: string }
+      | null;
+    // apiError responds `{success:false, error:{message, code}}`; reading a
+    // top-level `message` reported every failure as "Unknown error".
+    const message = errBody?.error?.message ?? errBody?.message ?? res.statusText;
+    throw new Error(`API error ${res.status}: ${message || "Unknown error"}`);
   }
 
-  return (await res.json()) as ComplianceResult;
+  // apiSuccess wraps the payload: `{success:true, data:{...}}`.
+  const json = (await res.json()) as { data?: unknown } | null;
+  const payload = (json && typeof json === "object" && "data" in json ? json.data : json) ?? {};
+  return normalizeRemoteResult(payload as RemoteCheckResult, config.model ?? DEFAULT_MODEL);
 }
 
 /**
@@ -198,15 +392,14 @@ function resolveFramework(
 
 /**
  * Detect the provider from the model name.
+ *
+ * 2026-07-29 (audit A1): this was a local copy that returned "google" for
+ * gemini-* and "meta" for llama-*. `createProvider` registers NEITHER, so it
+ * threw `Unknown provider "google"` and this command silently degraded to the
+ * dry-run report for every Gemini or Llama model. Now delegates to the single
+ * canonical mapper in lib/call-llm.ts.
  */
-function detectProvider(model: string): string {
-  if (model.startsWith("gpt-") || model.startsWith("o1") || model.startsWith("o3") || model.startsWith("o4")) return "openai";
-  if (model.startsWith("claude-")) return "anthropic";
-  if (model.startsWith("gemini-")) return "google";
-  if (model.startsWith("llama") || model.startsWith("meta-")) return "meta";
-  if (model.startsWith("mistral") || model.startsWith("mixtral")) return "mistral";
-  return "openai";
-}
+const detectProvider = detectProviderFromModel;
 
 /**
  * Run compliance check locally using @evalguard/core.
@@ -225,18 +418,11 @@ async function runLocalCheck(
     requirements?: unknown[];
   };
 
-  const model = config.model ?? "gpt-4o-mini";
+  const model = config.model ?? DEFAULT_MODEL;
   const providerName = config.provider ?? detectProvider(model);
 
-  // Resolve API key for the LLM provider
-  const apiKeyEnvMap: Record<string, string> = {
-    openai: "OPENAI_API_KEY",
-    anthropic: "ANTHROPIC_API_KEY",
-    google: "GOOGLE_API_KEY",
-    mistral: "MISTRAL_API_KEY",
-  };
-  const envVar = apiKeyEnvMap[providerName] ?? `${providerName.toUpperCase()}_API_KEY`;
-  const llmApiKey = process.env[envVar];
+  // Resolve API key for the LLM provider (same env var the remote path sends).
+  const llmApiKey = process.env[providerApiKeyEnvVar(providerName)];
 
   // Determine if this is an "enhanced" framework (has requirements) or a
   // "classic" framework (has categories.controls). They use different analysis paths.
@@ -273,17 +459,33 @@ async function runLocalCheck(
 
     if (llmApiKey && typeof runSecurityScan === "function") {
       try {
-        const provider = typeof createProvider === "function"
-          ? createProvider(providerName, { apiKey: llmApiKey, model })
-          : undefined;
+        // `runSecurityScan` drives the target model through `config.callLLM`
+        // (scanner.ts:28 destructures `{ prompt, attackTypes, callLLM }`). It
+        // does NOT accept `{ model, provider, apiKey }` and build a client
+        // itself.
+        //
+        // BUG FIXED 2026-07-29 (F31): this call passed model/provider/apiKey and
+        // NO callLLM, so every attack threw "callLLM is not a function", the
+        // scanner caught it into `[ERROR] …` findings, and the outer `catch`
+        // never fired because runSecurityScan RESOLVED. Reproduced against
+        // dist: 40 findings, all `output: "[ERROR] callLLM is not a function"`,
+        // errored:true / passed:false, which GapAnalysis then scored as real EU
+        // AI Act compliance FAILURES — overallScore 0 with 14 requirements
+        // marked not-met and notes reading "All N test(s) failed. Immediate
+        // remediation required." A user was shown fabricated non-compliance for
+        // a model that was never contacted.
+        const callLLM = await makeCallLLM(providerName, model, createProvider, llmApiKey);
 
         scanResults = await runSecurityScan({
-          model,
-          provider: provider ?? providerName,
           systemPrompt: config.systemPrompt ?? "You are a helpful assistant.",
           attackTypes: [...attackTypes],
-          apiKey: llmApiKey,
+          callLLM,
         });
+
+        // A scan whose attacks could not execute is NOT evidence of
+        // non-compliance. Treat it as no evidence at all (dry-run → untested)
+        // rather than letting GapAnalysis read `passed: false` as "failed".
+        scanResults = discardIfAllErrored(scanResults);
       } catch {
         // Fall through to dry-run mode
         scanResults = null;
@@ -355,16 +557,21 @@ async function runLocalCheck(
 
     if (llmApiKey && typeof runSecurityScan === "function") {
       try {
-        const provider = typeof createProvider === "function"
-          ? createProvider(providerName, { apiKey: llmApiKey, model })
-          : undefined;
+        // Same defect as the enhanced branch above (F31): no `callLLM` was
+        // wired. Here it additionally omitted `attackTypes`, so
+        // `attackTypes.includes` threw and the dry-run fallback engaged — which
+        // meant `compliance-check` against OWASP LLM Top 10 / NIST AI RMF /
+        // MITRE ATLAS NEVER actually tested the model, it only ever emitted an
+        // all-untested report. Both are fixed the same way.
+        const callLLM = await makeCallLLM(providerName, model, createProvider, llmApiKey);
 
         scanResults = await runSecurityScan({
-          model,
-          provider: provider ?? providerName,
           systemPrompt: config.systemPrompt ?? "You are a helpful assistant.",
-          apiKey: llmApiKey,
+          attackTypes: ATTACK_TYPE_NAMES(core),
+          callLLM,
         });
+
+        scanResults = discardIfAllErrored(scanResults);
       } catch {
         scanResults = null;
       }
@@ -696,13 +903,21 @@ export function registerComplianceCheck(program: Command): void {
             console.log("");
           }
 
-          // Exit code based on threshold
-          process.exit(result.overallScore >= threshold ? 0 : 1);
+          // Exit code based on threshold. Set process.exitCode + return rather
+          // than process.exit(): calling process.exit() while ora's spinner
+          // stream/interval is still tearing down aborts libuv with exit 127 on
+          // Windows (breaks CI exit codes). Same reason failSpinner() exists.
+          process.exitCode = result.overallScore >= threshold ? 0 : 1;
+          return;
         } catch (err) {
-          spinner?.fail(
-            `Compliance check failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          process.exit(1);
+          const msg = `Compliance check failed: ${err instanceof Error ? err.message : String(err)}`;
+          if (spinner) {
+            failSpinner(spinner, msg);
+          } else {
+            console.error(msg);
+            process.exitCode = 1;
+          }
+          return;
         }
       },
     );

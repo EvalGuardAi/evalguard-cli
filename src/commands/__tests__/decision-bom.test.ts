@@ -67,10 +67,25 @@ describe("fetchDecisionBomVerify", () => {
   });
 
   it("throws on a malformed response missing the verification block", async () => {
-    const fetchImpl = vi.fn(async () => envelope({ id: BOM })) as unknown as typeof fetch;
+    // `verdict` is present here on purpose so this test keeps testing what its
+    // name says. It used to send only `{ id }`, which is missing BOTH fields;
+    // once `expectResult` began requiring `verdict` (2026-08-10 — an absent
+    // verdict used to reach the renderer and die on `verdict.toUpperCase()`),
+    // the required-field check fired first and this assertion was measuring
+    // the wrong guard.
+    const fetchImpl = vi.fn(async () => envelope({ id: BOM, verdict: "allow" })) as unknown as typeof fetch;
     await expect(
       fetchDecisionBomVerify({ id: BOM, baseUrl: "https://x.test/api/v1", apiKey: "k", fetchImpl }),
     ).rejects.toThrow(/malformed server response/);
+  });
+
+  it("throws on a response missing the VERDICT (was: TypeError mid-render)", async () => {
+    const fetchImpl = vi.fn(async () =>
+      envelope({ id: BOM, verification: { valid: true } }),
+    ) as unknown as typeof fetch;
+    await expect(
+      fetchDecisionBomVerify({ id: BOM, baseUrl: "https://x.test/api/v1", apiKey: "k", fetchImpl }),
+    ).rejects.toThrow(/missing `verdict`/);
   });
 });
 

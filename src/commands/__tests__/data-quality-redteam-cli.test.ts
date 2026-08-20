@@ -4,11 +4,15 @@ import { Command } from "commander";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { jsonResponse } from "../../__tests__/helpers/response-double.js";
 import { registerRedTeam } from "../red-team.js";
 import { registerDatasets } from "../datasets.js";
 
-function jsonResponse(data: unknown) {
-  return { ok: true, status: 200, json: async () => ({ data }) };
+// Real Response — the CLI reads bodies with `res.text()` at its shared
+// fail-closed decode boundary (lib/http.ts); a `.json()`-only double does not
+// exercise the path the shipped CLI takes.
+function envelope(data: unknown): Response {
+  return jsonResponse({ data });
 }
 
 describe("CLI — red-team-plan + datasets health (E2E, fetch mocked)", () => {
@@ -28,7 +32,7 @@ describe("CLI — red-team-plan + datasets health (E2E, fetch mocked)", () => {
 
   it("red-team-plan: POSTs capability flags to /security/red-team-plan", async () => {
     const f = vi.fn(async () =>
-      jsonResponse({ plan: { categories: [{ id: "mcp-attack", name: "MCP", pluginCount: 3 }], plugins: [], totalPlugins: 3 } }),
+      envelope({ plan: { categories: [{ id: "mcp-attack", name: "MCP", pluginCount: 3 }], plugins: [], totalPlugins: 3 } }),
     );
     globalThis.fetch = f as unknown as typeof fetch;
 
@@ -48,7 +52,7 @@ describe("CLI — red-team-plan + datasets health (E2E, fetch mocked)", () => {
 
   it("datasets health: reads a JSON file and POSTs it to /datasets/health", async () => {
     const f = vi.fn(async () =>
-      jsonResponse({ health: { rowCount: 4, nonIid: { score: 0.2, nonIid: true } }, labelQuality: { issueCount: 1, estimatedNoiseRate: 0.25 } }),
+      envelope({ health: { rowCount: 4, nonIid: { score: 0.2, nonIid: true } }, labelQuality: { issueCount: 1, estimatedNoiseRate: 0.25 } }),
     );
     globalThis.fetch = f as unknown as typeof fetch;
 

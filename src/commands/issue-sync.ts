@@ -19,15 +19,17 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody, unwrapApiEnvelope } from "../lib/http.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function baseUrl(): string {
-  return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  return resolveBaseUrl();
 }
 
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) {
     console.error(chalk.red("EVALGUARD_API_KEY is not set. Run `evalguard login --key <key>` first."));
     process.exit(1);
@@ -82,25 +84,22 @@ export async function syncIssues(
   if (!Array.isArray(args.findings) || args.findings.length === 0) {
     throw new Error("findings must be a non-empty array");
   }
-  const f = args.fetchImpl ?? fetch;
+  const f = args.fetchImpl ?? boundedFetch;
   const res = await f(`${args.baseUrl}/integrations/issue-sync`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${args.apiKey}` },
     body: JSON.stringify({ projectId: args.projectId, provider: args.provider, findings: args.findings }),
   });
-  const text = await res.text();
+  // FAIL CLOSED via the shared boundary. The hand-rolled decode this replaces
+  // ended in `text ? JSON.parse(text) : {}` followed by `json.data ?? json`, so
+  // an EMPTY body became `{}` and an unrelated 200 was handed to the caller as
+  // an IssueSyncResponse — the same shape measured fail-open in sbom-monitor.
+  const decoded = await decodeJsonBody(res, "POST /integrations/issue-sync");
   if (!res.ok) {
-    let msg = `request failed (${res.status})`;
-    try {
-      const parsed = JSON.parse(text) as { error?: { message?: string } };
-      if (parsed?.error?.message) msg = parsed.error.message;
-    } catch {
-      msg = `${msg}: ${text.slice(0, 300)}`;
-    }
-    throw new Error(msg);
+    const detail = (decoded as { error?: { message?: string } } | null)?.error?.message;
+    throw new Error(`request failed (${res.status})${detail ? `: ${detail}` : ""}`);
   }
-  const json = text ? (JSON.parse(text) as { data?: IssueSyncResponse }) : {};
-  return (json.data ?? (json as IssueSyncResponse));
+  return unwrapApiEnvelope(decoded, "POST /integrations/issue-sync") as IssueSyncResponse;
 }
 
 async function readFindingsFile(file: string): Promise<IssueSyncFindingInput[]> {
@@ -138,6 +137,10 @@ export function registerIssueSync(program: Command): void {
         });
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
+          // Mirror the errorCount gate at the end of the text path (audit
+          // 2026-08-09: cli-json-branch-skips-exit-gate). Findings that failed to
+          // sync are a partial, silent data loss; `--json` reported it as success.
+          if (result.errorCount > 0) process.exit(1);
           return;
         }
         console.log(

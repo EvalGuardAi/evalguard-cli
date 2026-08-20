@@ -12,6 +12,7 @@ import chalk from "chalk";
 import ora from "ora";
 import * as fs from "fs";
 import * as path from "path";
+import { makeCallLLM } from "../lib/call-llm.js";
 
 type OptimizationStrategyName = "iterative-refinement" | "genetic" | "few-shot-injection" | "constraint-tightening";
 
@@ -289,27 +290,4 @@ function parseSimpleConfig(content: string): { prompt: string; cases: Array<{ in
   }
 
   return { prompt, cases };
-}
-
-async function makeCallLLM(
-  providerName: string,
-  model: string,
-  createProvider: any,
-): Promise<(prompt: string) => Promise<string>> {
-  const envMap: Record<string, string> = {
-    openai: "OPENAI_API_KEY",
-    anthropic: "ANTHROPIC_API_KEY",
-    gemini: "GEMINI_API_KEY",
-    mistral: "MISTRAL_API_KEY",
-    groq: "GROQ_API_KEY",
-    deepseek: "DEEPSEEK_API_KEY",
-  };
-  const envKey = envMap[providerName] ?? `${providerName.toUpperCase().replace(/-/g, "_")}_API_KEY`;
-  const apiKey = process.env[envKey] ?? process.env.EVALGUARD_PROVIDER_KEY ?? "";
-
-  const provider = createProvider(providerName as any, apiKey);
-  return async (prompt: string) => {
-    const response = await provider.chat([{ role: "user", content: prompt }], { model });
-    return response.content;
-  };
 }

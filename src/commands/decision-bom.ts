@@ -22,6 +22,7 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody, expectResult } from "../lib/http.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -43,14 +44,17 @@ function apiKey(): string {
 /** Shape of the fields this command reads from the server response. */
 export interface DecisionBomVerifyResult {
   id: string;
-  decisionId: string;
-  surface: string;
+  /** Everything the renderer treats as optional is TYPED optional — see the
+   *  renderer note; a type that over-promises is how `verdict.toUpperCase()`
+   *  passed `tsc` and threw at runtime. */
+  decisionId?: string;
+  surface?: string;
   verdict: string;
-  category: string;
-  signedAt: string;
-  createdAt: string;
-  bom: unknown;
-  signature: { algorithm: string; value: string; publicKeyPem: string };
+  category?: string;
+  signedAt?: string;
+  createdAt?: string;
+  bom?: unknown;
+  signature?: { algorithm: string; value: string; publicKeyPem: string };
   verification: { valid: boolean; reason?: string };
 }
 
@@ -68,25 +72,48 @@ export async function fetchDecisionBomVerify(opts: {
   if (!UUID_RE.test(opts.id)) {
     throw new Error(`decision-bom id must be a valid UUID. Got: ${opts.id}`);
   }
-  const fetchFn = opts.fetchImpl ?? fetch;
+  const fetchFn = opts.fetchImpl ?? boundedFetch;
   const res = await fetchFn(`${opts.baseUrl}/compliance/decision-bom/${encodeURIComponent(opts.id)}`, {
     method: "GET",
     headers: { authorization: `Bearer ${opts.apiKey}`, accept: "application/json" },
   });
 
-  const json = (await res.json().catch(() => ({}))) as {
-    data?: DecisionBomVerifyResult;
+  const json = (await decodeJsonBody(res, "decision-bom")) as {
     error?: { message?: string; code?: string };
-  };
+  } | null;
 
   if (!res.ok) {
     throw new Error(
-      `Decision-BOM verify failed: HTTP ${res.status} (${json.error?.code ?? "ERROR"}: ${json.error?.message ?? "unknown"})`,
+      `Decision-BOM verify failed: HTTP ${res.status} (${json?.error?.code ?? "ERROR"}: ${json?.error?.message ?? "unknown"})`,
     );
   }
-  const data = json.data ?? (json as unknown as DecisionBomVerifyResult);
-  if (!data || typeof data.verification?.valid !== "boolean") {
+  // `json.data ?? (json as unknown as T)` handed an unrelated 200 to the
+  // renderer; the `verification.valid` guard below caught the worst of it by
+  // luck, not by contract. Make the envelope handling explicit so a 200 carrying
+  // `{"success":false,…}` is an error rather than a "verification" object.
+  // `required` was empty, so a 200 carrying a verification block and nothing
+  // else passed the guard below and then died in the RENDERER:
+  //
+  //     TypeError: Cannot read properties of undefined (reading 'toUpperCase')
+  //         at …/dist/commands/decision-bom.js  (result.verdict.toUpperCase())
+  //
+  // Exit was non-zero, so no wrong artifact was produced — but an unhandled
+  // stack trace is not a refusal, and it names a line of our code rather than
+  // the server that sent an incomplete body. `id` + `verdict` are the two
+  // fields this route always sends and the renderer cannot do without; the rest
+  // are rendered defensively below.
+  const data = expectResult<DecisionBomVerifyResult>(json, "GET /decision-bom/:id", [
+    "id",
+    "verdict",
+  ]);
+  if (typeof data.verification?.valid !== "boolean") {
     throw new Error("Decision-BOM verify failed: malformed server response (no verification block)");
+  }
+  if (typeof data.verdict !== "string") {
+    throw new Error(
+      `Decision-BOM verify failed: the server's \`verdict\` is ${typeof data.verdict}, not a string — ` +
+        "refusing to render a compliance artifact from a body this command cannot read.",
+    );
   }
   return data;
 }
@@ -123,11 +150,16 @@ export function registerDecisionBom(program: Command): void {
       console.log(chalk.bold.cyan("  EvalGuard") + chalk.dim(" — Decision-BOM verification"));
       console.log(chalk.dim("  ─────────────────────────────────────────────"));
       console.log();
+      // Everything except `id`/`verdict` (both now required at the boundary) is
+      // rendered through `?? "—"`: an optional field that is absent must print
+      // a dash, never the word "undefined" — and never throw halfway down a
+      // compliance artifact, leaving the signature verdict unprinted.
+      const dash = chalk.dim("—");
       console.log(`  BOM id:    ${chalk.cyan(result.id)}`);
-      console.log(`  Decision:  ${chalk.cyan(result.decisionId)}`);
-      console.log(`  Surface:   ${result.surface}`);
-      console.log(`  Verdict:   ${verdictColor(result.verdict.toUpperCase())} ${chalk.dim(`(${result.category})`)}`);
-      console.log(`  Signed:    ${chalk.dim(result.signedAt)} (${result.signature.algorithm})`);
+      console.log(`  Decision:  ${result.decisionId ? chalk.cyan(result.decisionId) : dash}`);
+      console.log(`  Surface:   ${result.surface ?? dash}`);
+      console.log(`  Verdict:   ${verdictColor(result.verdict.toUpperCase())} ${chalk.dim(`(${result.category ?? "—"})`)}`);
+      console.log(`  Signed:    ${chalk.dim(result.signedAt ?? "—")} (${result.signature?.algorithm ?? "—"})`);
       console.log();
       console.log(`  ${statusColor("●")} Signature: ${statusColor(valid ? "VALID — artifact intact" : "TAMPERED / INVALID")}`);
       if (!valid && result.verification.reason) {

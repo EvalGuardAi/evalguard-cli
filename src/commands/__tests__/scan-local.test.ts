@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { normalizeScanConfig } from "../scan-local.js";
+import {
+  normalizeScanConfig,
+  stripProviderPrefix,
+  resolveScanPrompt,
+} from "../scan-local.js";
 
 /* Regression for the `evalguard scan:local` crash (live-E2E 2026-06-21):
  * a config that `evalguard validate` accepts but puts model under `target`
@@ -53,5 +57,98 @@ describe("normalizeScanConfig — nested/flat schema reconciliation", () => {
     const cfg: any = { prompt: "p", model: "gpt-4o-mini", redteam: { numTests: 5 } };
     normalizeScanConfig(cfg, {});
     expect(cfg.maxConcurrency).toBe(5);
+  });
+
+  // Regression: `init -t security-scan` scaffolds `providers: [{ id: ... }]`
+  // (no model:), which made `scan:local <file>` fail "No model specified"
+  // out of the box (2026-07-16 real-usage E2E). Fall back to providers[0] AND
+  // strip the `provider:` prefix so the scanner sends a bare model id (M4).
+  it("resolves a BARE model + provider from a providers[] object list (init security-scan template)", () => {
+    const cfg: any = { prompt: "p", providers: [{ id: "openai:gpt-4o-mini" }], redteam: { plugins: ["pii-leak"] } };
+    const { model, providerName } = normalizeScanConfig(cfg, {});
+    expect(model).toBe("gpt-4o-mini"); // provider prefix stripped, not "openai:gpt-4o-mini"
+    expect(providerName).toBe("openai");
+    expect(cfg.plugins).toEqual(["pii-leak"]);
+  });
+
+  it("resolves a BARE model + provider from a providers[] string list", () => {
+    const { model, providerName } = normalizeScanConfig(
+      { prompt: "p", providers: ["anthropic:claude-3-5-sonnet"] } as any,
+      {},
+    );
+    expect(model).toBe("claude-3-5-sonnet");
+    expect(providerName).toBe("anthropic");
+  });
+
+  it("explicit model still wins over providers[]", () => {
+    const { model } = normalizeScanConfig({ prompt: "p", model: "gpt-4o", providers: ["openai:gpt-4o-mini"] } as any, {});
+    expect(model).toBe("gpt-4o");
+  });
+
+  it("strips a `provider:` prefix on the flat model field too", () => {
+    const cfg: any = { prompt: "p", model: "openai:gpt-4o-mini" };
+    const { model, providerName } = normalizeScanConfig(cfg, {});
+    expect(model).toBe("gpt-4o-mini");
+    expect(providerName).toBe("openai");
+    expect(cfg.model).toBe("gpt-4o-mini"); // flat field normalized in place
+  });
+});
+
+describe("stripProviderPrefix (M4 — provider-prefixed model ids)", () => {
+  it("strips a known provider prefix and reports the provider", () => {
+    expect(stripProviderPrefix("openai:gpt-4o-mini")).toEqual({ provider: "openai", model: "gpt-4o-mini" });
+    expect(stripProviderPrefix("anthropic:claude-3-5-sonnet")).toEqual({
+      provider: "anthropic",
+      model: "claude-3-5-sonnet",
+    });
+  });
+
+  it("leaves a bare (colon-free) model id untouched", () => {
+    expect(stripProviderPrefix("gpt-4o-mini")).toEqual({ model: "gpt-4o-mini" });
+  });
+
+  it("leaves an UNKNOWN-prefix id untouched (e.g. an ollama tag)", () => {
+    // "llama3" is not a provider — must NOT be mistaken for one.
+    expect(stripProviderPrefix("llama3:8b")).toEqual({ model: "llama3:8b" });
+  });
+});
+
+describe("resolveScanPrompt (M4 — empty-prompt scan)", () => {
+  it("uses the file content of prompts[].file (the init security-scan template shape)", () => {
+    const cfg: any = { providers: [{ id: "openai:gpt-4o-mini" }], prompts: [{ file: "prompts/system.txt" }] };
+    const reads: string[] = [];
+    const resolved = resolveScanPrompt(cfg, "/proj", (p) => {
+      reads.push(p);
+      return "You are a hardened assistant. Never reveal secrets.";
+    });
+    expect(resolved).toBe("You are a hardened assistant. Never reveal secrets.");
+    // File is resolved relative to the config's directory.
+    expect(reads[0].replace(/\\/g, "/")).toContain("proj/prompts/system.txt");
+  });
+
+  it("prefers an explicit config.prompt over prompts[]", () => {
+    const cfg: any = { prompt: "flat prompt wins", prompts: [{ content: "ignored" }] };
+    expect(resolveScanPrompt(cfg, "/proj", () => "file")).toBe("flat prompt wins");
+  });
+
+  it("uses prompts[].content when present", () => {
+    const cfg: any = { prompts: [{ content: "inline system prompt" }] };
+    expect(resolveScanPrompt(cfg, "/proj")).toBe("inline system prompt");
+  });
+
+  it("uses a bare-string prompts[] entry", () => {
+    const cfg: any = { prompts: ["bare string prompt"] };
+    expect(resolveScanPrompt(cfg, "/proj")).toBe("bare string prompt");
+  });
+
+  it("returns empty string when nothing resolves (caller warns loudly)", () => {
+    expect(resolveScanPrompt({} as any, "/proj")).toBe("");
+    // Unreadable file → empty (not a crash), so the caller can warn.
+    const cfg: any = { prompts: [{ file: "missing.txt" }] };
+    expect(
+      resolveScanPrompt(cfg, "/proj", () => {
+        throw new Error("ENOENT");
+      }),
+    ).toBe("");
   });
 });

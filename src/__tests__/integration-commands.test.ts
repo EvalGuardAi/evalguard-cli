@@ -33,6 +33,7 @@ import {
   generateAssertions,
   generateRAGTests,
 } from "@evalguard/core";
+import { FEATURE_COUNTS } from "@evalguard/core/counts";
 
 import type {
   EvalOutput,
@@ -754,8 +755,8 @@ describe("list integration", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("should list all 47 strategies", () => {
-    expect(ALL_STRATEGIES.length).toBe(47);
+  it("should list every registered strategy (drift-gated vs canonical count)", () => {
+    expect(ALL_STRATEGIES.length).toBe(FEATURE_COUNTS.redTeamStrategies);
 
     for (const s of ALL_STRATEGIES) {
       expect(s.id).toBeTruthy();
@@ -769,8 +770,8 @@ describe("list integration", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("should list all 10 graders", () => {
-    expect(ALL_GRADERS.length).toBe(30);
+  it("should list all 45 graders", () => {
+    expect(ALL_GRADERS.length).toBe(45);
 
     for (const g of ALL_GRADERS) {
       expect(g.id).toBeTruthy();

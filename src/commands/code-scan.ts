@@ -148,6 +148,7 @@ export function registerCodeScan(program: Command): void {
             }>;
             linesScanned: number;
           }>;
+          lastScanStats: { filesScanned: number; filesWithFindings: number };
         };
       };
 
@@ -171,6 +172,11 @@ export function registerCodeScan(program: Command): void {
         ? scanner.scanDirectory(target, { exclude, maxFileSize, languages })
         : [scanner.scanFile(target)];
 
+      // `scanDirectory` returns ONLY files that HAVE findings, so `results.length`
+      // is NOT the number of files scanned — report the scanner's true count
+      // (single-file path scans exactly one file).
+      const filesScanned = stat.isDirectory() ? scanner.lastScanStats.filesScanned : 1;
+
       // Flatten + filter by severity, attach absolute file paths
       const findings: CodeFindingJson[] = [];
       for (const r of results) {
@@ -189,6 +195,15 @@ export function registerCodeScan(program: Command): void {
           });
         }
       }
+
+      // The CI gate. Computed ONCE here so every output path applies it — the
+      // `--format json` / `--format sarif` stdout branches used to `return`
+      // with exit 0, so `npx @evalguard/cli code-scan --format sarif > eg.sarif`
+      // reported success while the SARIF it just wrote contained a hardcoded
+      // API key. A machine-readable format must not silently weaken the gate.
+      const blockingCount = findings.filter(
+        (f) => f.severity === "critical" || f.severity === "high"
+      ).length;
 
       // JSON file output (CI consumption)
       if (opts.output) {
@@ -210,7 +225,7 @@ export function registerCodeScan(program: Command): void {
                   version: "1",
                   generatedAt: new Date().toISOString(),
                   target: path.relative(cwd, target),
-                  filesScanned: results.length,
+                  filesScanned,
                   findingsCount: findings.length,
                   severityCounts: {
                     critical: findings.filter((f) => f.severity === "critical").length,
@@ -227,9 +242,6 @@ export function registerCodeScan(program: Command): void {
         );
         console.log(`  ${chalk.green("✓")} Wrote ${findings.length} finding(s) to ${chalk.cyan(opts.output)}`);
         // Exit 1 if any critical/high — lets CI gate on this
-        const blockingCount = findings.filter(
-          (f) => f.severity === "critical" || f.severity === "high"
-        ).length;
         if (blockingCount > 0) process.exit(1);
         return;
       }
@@ -237,12 +249,14 @@ export function registerCodeScan(program: Command): void {
       // SARIF stdout (GitHub Code Scanning)
       if (opts.format === "sarif") {
         console.log(toSarif(findings));
+        if (blockingCount > 0) process.exit(1);
         return;
       }
 
       // JSON stdout
       if (opts.format === "json") {
         console.log(JSON.stringify({ findings }, null, 2));
+        if (blockingCount > 0) process.exit(1);
         return;
       }
 
@@ -253,7 +267,7 @@ export function registerCodeScan(program: Command): void {
 
       if (findings.length === 0) {
         console.log(chalk.green("  ✓ No vulnerabilities found"));
-        console.log(chalk.dim(`    Scanned ${results.length} file(s)`));
+        console.log(chalk.dim(`    Scanned ${filesScanned} file(s)`));
         return;
       }
 
@@ -299,7 +313,8 @@ export function registerCodeScan(program: Command): void {
       console.log();
       console.log(chalk.dim("  " + "-".repeat(70)));
       console.log(
-        `  Scanned ${chalk.bold(String(results.length))} file(s), found ${chalk.bold(String(findings.length))} finding(s) ` +
+        `  Scanned ${chalk.bold(String(filesScanned))} file(s), found ${chalk.bold(String(findings.length))} finding(s) ` +
+        `in ${chalk.bold(String(byFile.size))} file(s) ` +
         `(${chalk.red.bold(totalCritical)} critical, ${chalk.red(totalHigh)} high)`
       );
 

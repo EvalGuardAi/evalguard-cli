@@ -12,8 +12,53 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import {
+  boundedFetch,
+  decodeJsonBody,
+  expectBooleanField,
+  expectNumberField,
+  expectResult,
+} from "../lib/http.js";
+import {
+  parseCountFlag,
+  parseHttpUrlFlag,
+  parseUnitIntervalFlag,
+} from "../lib/arg-validate.js";
+
+/**
+ * What a dropped or out-of-range `--threshold` actually costs, said once and
+ * reused by all three subcommands.
+ *
+ * `--threshold <n>` used to declare `parseFloat` as Commander's coercion:
+ *
+ *   --threshold abc → NaN → `JSON.stringify` writes `"threshold":null` → the
+ *     field never reaches the server, whose own default (0.5) runs instead;
+ *   --threshold 5   → forwarded, and a max-category score lives in 0..1, so the
+ *     gate can never fire;
+ *   --threshold .7x → parseFloat silently returns 0.7.
+ *
+ * All three then print `clean (1.0%)` and exit 0. The operator walks away
+ * believing a stricter gate ran than the one that did — which, for a
+ * content-moderation tool, is the single most expensive thing to get wrong.
+ */
+const THRESHOLD_CONSEQUENCE =
+  "The flag would have been dropped at the wire and the server's DEFAULT threshold would have run, " +
+  "while the verdict on screen read as though yours had.";
+
+/**
+ * The ceiling POST /moderation/video actually enforces — its Zod body schema is
+ * `frames: z.array(...).min(1).max(256)`, `maxFrames: z.number().int().min(1).max(256)`,
+ * `sampleEveryN: …min(1).max(256)`. Copied rather than invented, so the CLI
+ * refuses exactly what the route refuses and nothing more.
+ */
+const MAX_VIDEO_FRAMES = 256;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const ENDPOINT_IMAGE = "POST /moderation/image";
+const ENDPOINT_VIDEO = "POST /moderation/video";
+const ENDPOINT_DEEPFAKE = "POST /moderation/deepfake";
 
 export interface ModerationApiOpts {
   baseUrl: string;
@@ -22,13 +67,13 @@ export interface ModerationApiOpts {
 }
 
 async function callModeration(path: string, payload: unknown, args: ModerationApiOpts): Promise<unknown> {
-  const f = args.fetchImpl ?? fetch;
+  const f = args.fetchImpl ?? boundedFetch;
   const res = await f(`${args.baseUrl}${path}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${args.apiKey}`, "content-type": "application/json" },
     body: JSON.stringify(payload),
   });
-  const json = await res.json().catch(() => null);
+  const json = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (json as { error?: { message?: string } } | null)?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
@@ -123,12 +168,12 @@ export async function detectDeepfake(
 }
 
 function envConfig(): ModerationApiOpts {
-  const apiKey = process.env.EVALGUARD_API_KEY;
+  const apiKey = resolveApiKey();
   if (!apiKey) {
     console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`."));
     process.exit(1);
   }
-  return { baseUrl: process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1", apiKey };
+  return { baseUrl: resolveBaseUrl(), apiKey };
 }
 
 async function readImageBase64(file: string): Promise<{ base64: string; mimeType?: string }> {
@@ -157,7 +202,10 @@ export function registerModeration(program: Command): void {
     .requiredOption("--project <id>", "Project UUID")
     .option("--url <url>", "Public image URL")
     .option("--file <path>", "Local image file (base64-encoded locally)")
-    .option("--threshold <n>", "Flag threshold on the max category score (0..1)", parseFloat)
+    // NO `parseFloat` coercion — see THRESHOLD_CONSEQUENCE. Commander would run
+    // it before the action, so the action could no longer tell "abc" (a typo)
+    // from a deliberate absence: both arrive as a falsy number.
+    .option("--threshold <n>", "Flag threshold on the max category score (0..1)")
     .option("--json", "Output as JSON", false)
     .action(
       async (opts: {
@@ -165,29 +213,43 @@ export function registerModeration(program: Command): void {
         project: string;
         url?: string;
         file?: string;
-        threshold?: number;
+        threshold?: string;
         json?: boolean;
       }) => {
+        // OUTSIDE the try: a refusal is not a moderation failure, and wrapping
+        // it would turn an exit-2 usage error into "moderation image failed" +
+        // exit 1. The validators exit the process themselves.
+        const threshold = parseUnitIntervalFlag(opts.threshold, "--threshold", THRESHOLD_CONSEQUENCE);
+        const url = parseHttpUrlFlag(
+          opts.url,
+          "--url",
+          "The server has to reject it, so this costs a round trip to learn what `new URL()` knows locally.",
+        );
         try {
-          if (!opts.url && !opts.file) throw new Error("provide --url or --file");
+          if (!url && !opts.file) throw new Error("provide --url or --file");
           const img = opts.file ? await readImageBase64(opts.file) : undefined;
-          const body = (await moderateImage({
+          const body = await moderateImage({
             orgId: opts.org,
             projectId: opts.project,
-            imageUrl: opts.url,
+            imageUrl: url,
             imageBase64: img?.base64,
             mimeType: img?.mimeType,
-            threshold: opts.threshold,
+            threshold,
             ...envConfig(),
-          })) as {
-            data?: { flagged: boolean; score: number; categories: string[]; provider?: string };
-          };
-          const result =
-            body.data ??
-            (body as unknown as { flagged: boolean; score: number; categories: string[]; provider?: string });
+          });
+          // A CONTENT-MODERATION VERDICT, so it is refused rather than
+          // reconstructed. `body.data ?? (body as unknown as …)` printed
+          // `clean (NaN%)` with exit 0 against a 200 carrying
+          // `{"success":false,"error":{"message":"vision provider timed out"}}`
+          // — the backend said it had failed and the CLI answered "clean".
+          const result = expectResult<{
+            flagged: boolean; score: number; categories?: string[]; provider?: string;
+          }>(body, ENDPOINT_IMAGE);
+          const flagged = expectBooleanField(result, "flagged", ENDPOINT_IMAGE);
+          const score = expectNumberField(result, "score", ENDPOINT_IMAGE);
           if (opts.json) return void console.log(JSON.stringify(result, null, 2));
-          const pct = (result.score * 100).toFixed(1);
-          const verdict = result.flagged
+          const pct = (score * 100).toFixed(1);
+          const verdict = flagged
             ? chalk.red(`FLAGGED (${pct}%)`)
             : chalk.green(`clean (${pct}%)`);
           console.log();
@@ -207,36 +269,61 @@ export function registerModeration(program: Command): void {
     .requiredOption("--org <id>", "Org UUID")
     .requiredOption("--project <id>", "Project UUID")
     .requiredOption("--frame <url...>", "Frame image URL(s) — repeat or space-separate")
-    .option("--threshold <n>", "Flag threshold on the max frame score (0..1)", parseFloat)
-    .option("--max-frames <n>", "Cap on frames moderated", (v) => parseInt(v, 10))
-    .option("--sample-every <n>", "Take every Nth frame", (v) => parseInt(v, 10))
+    // Same removal of the silent `parseFloat` / `parseInt` coercions as `image`.
+    // Fixing one subcommand and leaving its two siblings is not a fix — the next
+    // operator simply hits the same wall from `video`.
+    .option("--threshold <n>", "Flag threshold on the max frame score (0..1)")
+    .option("--max-frames <n>", "Cap on frames moderated")
+    .option("--sample-every <n>", "Take every Nth frame")
     .option("--json", "Output as JSON", false)
     .action(
       async (opts: {
         org: string;
         project: string;
         frame: string[];
-        threshold?: number;
-        maxFrames?: number;
-        sampleEvery?: number;
+        threshold?: string;
+        maxFrames?: string;
+        sampleEvery?: string;
         json?: boolean;
       }) => {
+        const threshold = parseUnitIntervalFlag(opts.threshold, "--threshold", THRESHOLD_CONSEQUENCE);
+        const maxFrames = parseCountFlag(opts.maxFrames, "--max-frames", {
+          max: MAX_VIDEO_FRAMES,
+          consequence: "A NaN cap is dropped at the wire and every supplied frame would have been moderated.",
+        });
+        const sampleEvery = parseCountFlag(opts.sampleEvery, "--sample-every", {
+          max: MAX_VIDEO_FRAMES,
+          consequence: "A NaN stride is dropped at the wire and every frame would have been sampled.",
+        });
+        const frames = opts.frame.map((raw, i) => ({
+          imageUrl: parseHttpUrlFlag(
+            raw,
+            `--frame[${i}]`,
+            "The server has to reject it, so this costs a round trip per bad frame.",
+          )!,
+        }));
         try {
-          const body = (await moderateVideo({
+          const body = await moderateVideo({
             orgId: opts.org,
             projectId: opts.project,
-            frames: opts.frame.map((url) => ({ imageUrl: url })),
-            threshold: opts.threshold,
-            maxFrames: opts.maxFrames,
-            sampleEveryN: opts.sampleEvery,
+            frames,
+            threshold,
+            maxFrames,
+            sampleEveryN: sampleEvery,
             ...envConfig(),
-          })) as { data?: { flagged: boolean; score: number; categories: string[]; firstFlaggedFrame?: number; framesEvaluated: number } };
-          const r = body.data ?? (body as unknown as { flagged: boolean; score: number; categories: string[]; firstFlaggedFrame?: number; framesEvaluated: number });
+          });
+          const r = expectResult<{
+            flagged: boolean; score: number; categories?: string[];
+            firstFlaggedFrame?: number; framesEvaluated?: number;
+          }>(body, ENDPOINT_VIDEO);
+          const flagged = expectBooleanField(r, "flagged", ENDPOINT_VIDEO);
+          const score = expectNumberField(r, "score", ENDPOINT_VIDEO);
+          const framesEvaluated = expectNumberField(r, "framesEvaluated", ENDPOINT_VIDEO);
           if (opts.json) return void console.log(JSON.stringify(r, null, 2));
-          const pct = (r.score * 100).toFixed(1);
-          const verdict = r.flagged ? chalk.red(`FLAGGED (${pct}%)`) : chalk.green(`clean (${pct}%)`);
+          const pct = (score * 100).toFixed(1);
+          const verdict = flagged ? chalk.red(`FLAGGED (${pct}%)`) : chalk.green(`clean (${pct}%)`);
           console.log();
-          console.log(`  ${verdict}  ${chalk.dim(`${r.framesEvaluated} frame(s)`)}${r.firstFlaggedFrame !== undefined ? chalk.dim(`  first@${r.firstFlaggedFrame}`) : ""}`);
+          console.log(`  ${verdict}  ${chalk.dim(`${framesEvaluated} frame(s)`)}${r.firstFlaggedFrame !== undefined ? chalk.dim(`  first@${r.firstFlaggedFrame}`) : ""}`);
           if (r.categories?.length) console.log(`  ${chalk.dim("categories:")} ${r.categories.join(", ")}`);
           console.log();
         } catch (e) {
@@ -253,25 +340,45 @@ export function registerModeration(program: Command): void {
     .requiredOption("--project <id>", "Project UUID")
     .option("--url <url>", "Image URL (image mode)")
     .option("--frame <url...>", "Frame image URL(s) for video mode")
-    .option("--threshold <n>", "Synthetic threshold (0..1)", parseFloat)
+    .option("--threshold <n>", "Synthetic threshold (0..1)")
     .option("--json", "Output as JSON", false)
     .action(
-      async (opts: { org: string; project: string; url?: string; frame?: string[]; threshold?: number; json?: boolean }) => {
+      async (opts: { org: string; project: string; url?: string; frame?: string[]; threshold?: string; json?: boolean }) => {
+        const threshold = parseUnitIntervalFlag(opts.threshold, "--threshold", THRESHOLD_CONSEQUENCE);
+        const url = parseHttpUrlFlag(
+          opts.url,
+          "--url",
+          "The server has to reject it, so this costs a round trip to learn what `new URL()` knows locally.",
+        );
+        const frames = opts.frame?.map((raw, i) => ({
+          imageUrl: parseHttpUrlFlag(
+            raw,
+            `--frame[${i}]`,
+            "The server has to reject it, so this costs a round trip per bad frame.",
+          )!,
+        }));
         try {
-          if (!opts.url && !(opts.frame && opts.frame.length)) throw new Error("provide --url (image) or --frame (video)");
-          const body = (await detectDeepfake({
+          if (!url && !(frames && frames.length)) throw new Error("provide --url (image) or --frame (video)");
+          const body = await detectDeepfake({
             orgId: opts.org,
             projectId: opts.project,
-            kind: opts.frame && opts.frame.length ? "video" : "image",
-            imageUrl: opts.url,
-            frames: opts.frame?.map((url) => ({ imageUrl: url })),
-            threshold: opts.threshold,
+            kind: frames && frames.length ? "video" : "image",
+            imageUrl: url,
+            frames,
+            threshold,
             ...envConfig(),
-          })) as { data?: { synthetic: boolean; probability: number; label?: string } };
-          const r = body.data ?? (body as unknown as { synthetic: boolean; probability: number; label?: string });
+          });
+          // Measured before this change: `likely genuine (NaN% synthetic)`,
+          // exit 0, against a backend that had explicitly reported failure.
+          const r = expectResult<{ synthetic: boolean; probability: number; label?: string }>(
+            body,
+            ENDPOINT_DEEPFAKE,
+          );
+          const synthetic = expectBooleanField(r, "synthetic", ENDPOINT_DEEPFAKE);
+          const probability = expectNumberField(r, "probability", ENDPOINT_DEEPFAKE);
           if (opts.json) return void console.log(JSON.stringify(r, null, 2));
-          const pct = (r.probability * 100).toFixed(1);
-          const verdict = r.synthetic ? chalk.red(`likely SYNTHETIC (${pct}%)`) : chalk.green(`likely genuine (${pct}% synthetic)`);
+          const pct = (probability * 100).toFixed(1);
+          const verdict = synthetic ? chalk.red(`likely SYNTHETIC (${pct}%)`) : chalk.green(`likely genuine (${pct}% synthetic)`);
           console.log();
           console.log(`  ${verdict}${r.label ? chalk.dim(`  [${r.label}]`) : ""}`);
           console.log();

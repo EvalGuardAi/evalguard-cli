@@ -28,9 +28,84 @@ import {
   resolveBaseUrl,
   resolveProjectId,
 } from "../lib/config.js";
+import {
+  decodeJsonBody,
+  expectArray,
+  expectArrayField,
+  expectResult,
+  timedFetch,
+  unwrapApiEnvelope,
+} from "../lib/http.js";
+import {
+  LOOSE_UUID_RE,
+  parseCountFlag,
+  parseUuidArg,
+  requireNonEmptyFlag,
+} from "../lib/arg-validate.js";
 
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_RE = LOOSE_UUID_RE;
+
+/**
+ * The row ceilings these routes actually apply, copied from the routes so the
+ * CLI refuses exactly what the server would have silently clamped — not a
+ * number chosen because it felt safe.
+ *
+ *   /security   `Math.max(1, Math.min(Number(limit) || 50, 200))`
+ *   /prompts    the same expression, same 200
+ *   /traces     `Math.min(Number(limit ?? 100), 1000)`
+ *   /webhooks/deliveries
+ *               `Math.min(Math.max(1, isNaN(raw) ? 50 : raw), 200)`
+ *
+ * Every one of them CLAMPS rather than errors, which is why `-n 99999999999`
+ * used to return a page of rows the operator reads as "that is all there is".
+ */
+const MAX_ROWS = { security: 200, prompts: 200, traces: 1000, deliveries: 200 } as const;
+
+/**
+ * What a silently-dropped `-n` costs, said once. All five list commands did
+ * `opts.limit ? parseInt(opts.limit, 10) : undefined` and then `if (limit)`,
+ * so `abc` and `0` both became falsy, the flag vanished from the query string,
+ * and the route's own default (50 / 100) answered instead — under a header
+ * that reads `Security Scans (50)`.
+ */
+const LIMIT_CONSEQUENCE =
+  "The flag would have been dropped and the endpoint's DEFAULT page size would have answered instead.";
+
+/** What an empty `--project` costs. See lib/config.ts#resolveProjectId. */
+const PROJECT_CONSEQUENCE =
+  "An empty id is not 'unspecified' — the CLI would have silently used the org's DEFAULT project " +
+  "and printed ITS rows under the id you thought you passed.";
+
+/**
+ * Read `--project` from wherever Commander actually parked it.
+ *
+ * Found while testing the empty-`--project` refusal, and it is strictly worse
+ * than the defect that led here: on `traces get` and `prompts get`, a
+ * PERFECTLY VALID `--project` was being discarded outright. Both subcommands
+ * declare `--project`, and so does their PARENT (`traces` / `prompts`, the list
+ * commands) — and Commander lets a parent option consume a token that appears
+ * after the subcommand name. Measured:
+ *
+ *     traces get <id> --project 0000…a2   → subcommand opts.project === undefined
+ *                                           parent opts.project    === "0000…a2"
+ *
+ * `resolveProjectId(undefined)` then auto-resolved the org's DEFAULT project,
+ * so an operator asking for a trace in project B had it looked up in project A
+ * — the same cross-project answer as `runs --project ""`, reached by a caller
+ * who did everything right.
+ *
+ * The fix is to LOOK where the value is, rather than to delete the flag: unlike
+ * `logs list -n` (a short form that duplicated an unrelated parent flag),
+ * `--project` here means the same thing on parent and child, so falling back to
+ * the parent's value is exactly what the user meant. The child's own value
+ * still wins when Commander does deliver one, so nothing changes for the
+ * top-level list commands.
+ */
+function projectFlag(opts: { project?: string }, cmd: Command): string | undefined {
+  if (opts.project !== undefined) return opts.project;
+  const parent = cmd.parent as Command | null | undefined;
+  return parent ? (parent.opts() as { project?: string }).project : undefined;
+}
 
 /** Resolve the API key or print a clear hint and exit. */
 function requireApiKey(): string {
@@ -70,17 +145,25 @@ export async function apiRequest(opts: {
   apiKey: string;
   fetchImpl?: typeof fetch;
 }): Promise<unknown> {
-  const fetchFn = opts.fetchImpl ?? fetch;
-  const res = await fetchFn(`${opts.baseUrl}${opts.path}`, {
-    method: opts.method ?? "GET",
-    headers: {
-      authorization: `Bearer ${opts.apiKey}`,
-      "content-type": "application/json",
+  const method = opts.method ?? "GET";
+  const res = await timedFetch(
+    `${opts.baseUrl}${opts.path}`,
+    {
+      method,
+      headers: {
+        authorization: `Bearer ${opts.apiKey}`,
+        "content-type": "application/json",
+      },
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
     },
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-  });
+    { fetchImpl: opts.fetchImpl },
+  );
 
-  const parsed = await res.json().catch(() => null);
+  // FAIL CLOSED. This used to be `await res.json().catch(() => null)`, which
+  // turned an unreadable 200 into `null` and let every caller below print its
+  // "nothing found" empty state and exit 0 — see lib/http.ts for the measured
+  // table.
+  const parsed = await decodeJsonBody(res, `${method} ${opts.path}`);
   if (!res.ok) {
     const err = (parsed as { error?: { code?: string; message?: string } } | null)?.error;
     const detail = err ? ` (${err.code ?? "ERROR"}: ${err.message ?? "unknown"})` : "";
@@ -89,12 +172,17 @@ export async function apiRequest(opts: {
   return parsed;
 }
 
-/** Unwrap a `{ success, data }` envelope, tolerating a raw body. */
-function unwrap<T = unknown>(body: unknown): T {
-  if (body && typeof body === "object" && "data" in (body as Record<string, unknown>)) {
-    return (body as { data: T }).data;
-  }
-  return body as T;
+/**
+ * Unwrap a `{ success, data }` envelope, tolerating a raw body.
+ *
+ * Delegates to the shared contract in `lib/http.ts` (which mirrors the MCP
+ * server's) rather than re-deriving one. The previous local version used
+ * `"data" in body` — a prototype-chain read — and returned `data` even when it
+ * was `null`, which is exactly how `{"success":true,"data":null}` became
+ * "No eval runs found for this project." with exit 0.
+ */
+function unwrap<T = unknown>(body: unknown, endpoint = "the EvalGuard API"): T {
+  return unwrapApiEnvelope(body, endpoint) as T;
 }
 
 // ─── Typed shapes (best-effort — server is canonical) ────────────────────────
@@ -170,8 +258,35 @@ export async function fetchEvalRuns(opts: {
     apiKey: opts.apiKey,
     fetchImpl: opts.fetchImpl,
   });
-  return unwrap<EvalRunSummary[]>(body) ?? [];
+  return expectArray(unwrap(body, "GET /evals"), "GET /evals") as EvalRunSummary[];
 }
+
+/**
+ * The fields that make a body THIS route's answer.
+ *
+ * ADDED 2026-08-10, after the 28 x 10 fault-mode matrix. The LIST fetchers were
+ * closed by `expectArray` in the 2026-08-08 pass; the two single-record
+ * fetchers ended at a bare `unwrap<Record<string, unknown>>(body)`, which is an
+ * unwrap with no contract — an object is an object. Measured on the built 3.8.0
+ * CLI against a stub answering 200 + `{}`:
+ *
+ *     $ evalguard runs get 33333333-3333-4333-8333-333333333333
+ *         Eval run
+ *         ID: 33333333-3333-4333-8333-333333333333
+ *         Status: —                                    EXIT 0
+ *     $ evalguard scans get 33333333-3333-4333-8333-333333333333
+ *         Security Scan 33333333
+ *         Status: —                                    EXIT 0
+ *
+ * Nothing on either screen came from the server. The title is the renderer's
+ * `?? "Eval run"`, the status is its `?? ""`, and the ID is the one the USER
+ * typed, handed back by `run.id ?? id` — so the output looks like a successful
+ * lookup of exactly the record that was asked for. `id` + `status` are the two
+ * columns both routes always send (they are non-optional on `EvalRunSummary` /
+ * `ScanSummary` above), so requiring them distinguishes "this is that record"
+ * from "this is some 200".
+ */
+const RECORD_FIELDS = ["id", "status"] as const;
 
 /** GET /evals/:id → single eval run (apiSuccess object). */
 export async function fetchEvalRun(opts: {
@@ -186,7 +301,7 @@ export async function fetchEvalRun(opts: {
     apiKey: opts.apiKey,
     fetchImpl: opts.fetchImpl,
   });
-  return unwrap<Record<string, unknown>>(body);
+  return expectResult<Record<string, unknown>>(body, "GET /evals/:id", RECORD_FIELDS);
 }
 
 /** GET /security?projectId=... → security scan list (apiSuccess array). */
@@ -205,7 +320,7 @@ export async function fetchScans(opts: {
     apiKey: opts.apiKey,
     fetchImpl: opts.fetchImpl,
   });
-  return unwrap<ScanSummary[]>(body) ?? [];
+  return expectArray(unwrap(body, "GET /security"), "GET /security") as ScanSummary[];
 }
 
 /** GET /security/:id → single scan (apiSuccess object). */
@@ -221,7 +336,8 @@ export async function fetchScan(opts: {
     apiKey: opts.apiKey,
     fetchImpl: opts.fetchImpl,
   });
-  return unwrap<Record<string, unknown>>(body);
+  // Same contract as `fetchEvalRun`, and this one renders a SECURITY verdict.
+  return expectResult<Record<string, unknown>>(body, "GET /security/:id", RECORD_FIELDS);
 }
 
 /**
@@ -245,8 +361,10 @@ export async function fetchTraces(opts: {
     apiKey: opts.apiKey,
     fetchImpl: opts.fetchImpl,
   });
-  const data = unwrap<{ traces?: TraceSummary[] }>(body);
-  return data?.traces ?? [];
+  // `data?.traces ?? []` here turned a 200 carrying `{"hello":"world"}` into
+  // "No traces found for this project." with exit 0 — measured. See
+  // expectArrayField in lib/http.ts.
+  return expectArrayField(unwrap(body, "GET /traces"), "traces", "GET /traces") as TraceSummary[];
 }
 
 /**
@@ -289,7 +407,7 @@ export async function fetchPrompts(opts: {
     apiKey: opts.apiKey,
     fetchImpl: opts.fetchImpl,
   });
-  return unwrap<PromptVersion[]>(body) ?? [];
+  return expectArray(unwrap(body, "GET /prompts"), "GET /prompts") as PromptVersion[];
 }
 
 /** GET /scorers → server-side scorer registry. The server wraps an array in
@@ -305,8 +423,9 @@ export async function fetchServerScorers(opts: {
     apiKey: opts.apiKey,
     fetchImpl: opts.fetchImpl,
   });
-  const data = unwrap<{ scorers?: ServerScorer[] }>(body);
-  return data?.scorers ?? [];
+  // Was `data?.scorers ?? []`, which rendered an unrelated 200 as
+  // "Server Scorers (0)" and exited 0.
+  return expectArrayField(unwrap(body, "GET /scorers"), "scorers", "GET /scorers") as ServerScorer[];
 }
 
 /** GET /webhooks?orgId=... → webhook list (apiSuccess array). */
@@ -325,7 +444,7 @@ export async function fetchWebhooks(opts: {
     apiKey: opts.apiKey,
     fetchImpl: opts.fetchImpl,
   });
-  return unwrap<WebhookRow[]>(body) ?? [];
+  return expectArray(unwrap(body, "GET /webhooks"), "GET /webhooks") as WebhookRow[];
 }
 
 /**
@@ -395,15 +514,18 @@ export async function testWebhook(opts: {
     apiKey: opts.apiKey,
     fetchImpl: opts.fetchImpl,
   });
-  const data = unwrap<{
-    deliveries?: Array<{ event: string; success: boolean; status_code: number | null; created_at: string }>;
-    total?: number;
-  }>(body);
-  const deliveries = data?.deliveries ?? [];
+  const data = unwrap(body, "GET /webhooks/deliveries");
+  // `data?.deliveries ?? []` reported an unreadable response as "0 deliveries,
+  // 100% success" — a health figure computed from a body nobody could read.
+  const deliveries = expectArrayField(
+    data,
+    "deliveries",
+    "GET /webhooks/deliveries",
+  ) as Array<{ event: string; success: boolean; status_code: number | null; created_at: string }>;
   const successCount = deliveries.filter((d) => d.success).length;
   return {
     webhookId: opts.webhookId,
-    total: data?.total ?? deliveries.length,
+    total: (data as { total?: number })?.total ?? deliveries.length,
     recent: deliveries,
     successRate: deliveries.length ? successCount / deliveries.length : null,
     lastDeliveryAt: deliveries[0]?.created_at ?? null,
@@ -436,9 +558,10 @@ export function registerServerRead(program: Command): void {
     .option("--project <projectId>", "Project ID (defaults to your org's current project)")
     .option("--json", "Output as JSON", false)
     .action(async (opts: { project?: string; json?: boolean }) => {
+      const project = requireNonEmptyFlag(opts.project, "--project", PROJECT_CONSEQUENCE);
       const apiKey = requireApiKey();
       const baseUrl = resolveBaseUrl();
-      const projectId = await resolveProjectId(opts.project);
+      const projectId = await resolveProjectId(project);
       const rows = await fetchEvalRuns({ projectId, baseUrl, apiKey });
       if (opts.json) {
         console.log(JSON.stringify(rows, null, 2));
@@ -464,7 +587,17 @@ export function registerServerRead(program: Command): void {
     .command("get <id>")
     .description("Show a single eval run (GET /evals/:id)")
     .option("--json", "Output as JSON", false)
-    .action(async (id: string, opts: { json?: boolean }) => {
+    .action(async (rawId: string, opts: { json?: boolean }) => {
+      // Its siblings `traces get`, `webhooks test` and `decision-bom verify`
+      // all validate their id; these two did not. The id is
+      // `encodeURIComponent`-ed before it reaches the URL, so
+      // `runs get ../../scorers` was never a traversal — it was a round trip
+      // spent rendering a 404 that a local check answers instantly.
+      const id = parseUuidArg(
+        rawId,
+        "eval run id",
+        "The request would have gone out anyway and come back 404 — this is the same check `traces get` already does.",
+      );
       const apiKey = requireApiKey();
       const baseUrl = resolveBaseUrl();
       const run = await fetchEvalRun({ id, baseUrl, apiKey });
@@ -490,10 +623,14 @@ export function registerServerRead(program: Command): void {
     .option("-n, --limit <number>", "Max scans to show", "50")
     .option("--json", "Output as JSON", false)
     .action(async (opts: { project?: string; limit?: string; json?: boolean }) => {
+      const project = requireNonEmptyFlag(opts.project, "--project", PROJECT_CONSEQUENCE);
+      const limit = parseCountFlag(opts.limit, "-n, --limit", {
+        max: MAX_ROWS.security,
+        consequence: LIMIT_CONSEQUENCE,
+      });
       const apiKey = requireApiKey();
       const baseUrl = resolveBaseUrl();
-      const projectId = await resolveProjectId(opts.project);
-      const limit = opts.limit ? parseInt(opts.limit, 10) : undefined;
+      const projectId = await resolveProjectId(project);
       const rows = await fetchScans({ projectId, limit, baseUrl, apiKey });
       if (opts.json) {
         console.log(JSON.stringify(rows, null, 2));
@@ -520,7 +657,12 @@ export function registerServerRead(program: Command): void {
     .command("get <id>")
     .description("Show a single security scan (GET /security/:id)")
     .option("--json", "Output as JSON", false)
-    .action(async (id: string, opts: { json?: boolean }) => {
+    .action(async (rawId: string, opts: { json?: boolean }) => {
+      const id = parseUuidArg(
+        rawId,
+        "security scan id",
+        "The request would have gone out anyway and come back 404 — and this one renders a SECURITY verdict.",
+      );
       const apiKey = requireApiKey();
       const baseUrl = resolveBaseUrl();
       const scan = await fetchScan({ id, baseUrl, apiKey });
@@ -544,10 +686,14 @@ export function registerServerRead(program: Command): void {
     .option("-n, --limit <number>", "Max traces to show", "50")
     .option("--json", "Output as JSON", false)
     .action(async (opts: { project?: string; limit?: string; json?: boolean }) => {
+      const project = requireNonEmptyFlag(opts.project, "--project", PROJECT_CONSEQUENCE);
+      const limit = parseCountFlag(opts.limit, "-n, --limit", {
+        max: MAX_ROWS.traces,
+        consequence: LIMIT_CONSEQUENCE,
+      });
       const apiKey = requireApiKey();
       const baseUrl = resolveBaseUrl();
-      const projectId = await resolveProjectId(opts.project);
-      const limit = opts.limit ? parseInt(opts.limit, 10) : undefined;
+      const projectId = await resolveProjectId(project);
       const rows = await fetchTraces({ projectId, limit, baseUrl, apiKey });
       if (opts.json) {
         console.log(JSON.stringify(rows, null, 2));
@@ -574,10 +720,11 @@ export function registerServerRead(program: Command): void {
     .description("Show a single trace waterfall (GET /traces/:traceId)")
     .option("--project <projectId>", "Project ID (defaults to your org's current project)")
     .option("--json", "Output as JSON", false)
-    .action(async (traceId: string, opts: { project?: string; json?: boolean }) => {
+    .action(async (traceId: string, opts: { project?: string; json?: boolean }, cmd: Command) => {
+      const project = requireNonEmptyFlag(projectFlag(opts, cmd), "--project", PROJECT_CONSEQUENCE);
       const apiKey = requireApiKey();
       const baseUrl = resolveBaseUrl();
-      const projectId = await resolveProjectId(opts.project);
+      const projectId = await resolveProjectId(project);
       const trace = await fetchTrace({ traceId, projectId, baseUrl, apiKey });
       if (opts.json) {
         console.log(JSON.stringify(trace, null, 2));
@@ -613,10 +760,14 @@ export function registerServerRead(program: Command): void {
     .option("-n, --limit <number>", "Max versions to show", "50")
     .option("--json", "Output as JSON", false)
     .action(async (opts: { project?: string; limit?: string; json?: boolean }) => {
+      const project = requireNonEmptyFlag(opts.project, "--project", PROJECT_CONSEQUENCE);
+      const limit = parseCountFlag(opts.limit, "-n, --limit", {
+        max: MAX_ROWS.prompts,
+        consequence: LIMIT_CONSEQUENCE,
+      });
       const apiKey = requireApiKey();
       const baseUrl = resolveBaseUrl();
-      const projectId = await resolveProjectId(opts.project);
-      const limit = opts.limit ? parseInt(opts.limit, 10) : undefined;
+      const projectId = await resolveProjectId(project);
       const rows = await fetchPrompts({ projectId, limit, baseUrl, apiKey });
       if (opts.json) {
         console.log(JSON.stringify(rows, null, 2));
@@ -642,10 +793,11 @@ export function registerServerRead(program: Command): void {
     .description("Show all versions of a named prompt (GET /prompts filtered by name)")
     .option("--project <projectId>", "Project ID (defaults to your org's current project)")
     .option("--json", "Output as JSON", false)
-    .action(async (name: string, opts: { project?: string; json?: boolean }) => {
+    .action(async (name: string, opts: { project?: string; json?: boolean }, cmd: Command) => {
+      const project = requireNonEmptyFlag(projectFlag(opts, cmd), "--project", PROJECT_CONSEQUENCE);
       const apiKey = requireApiKey();
       const baseUrl = resolveBaseUrl();
-      const projectId = await resolveProjectId(opts.project);
+      const projectId = await resolveProjectId(project);
       // The server has no /prompts/:name route; list the project's versions and
       // filter to the requested name (versions descending in the API response).
       const all = await fetchPrompts({ projectId, limit: 200, baseUrl, apiKey });
@@ -764,9 +916,16 @@ export function registerServerRead(program: Command): void {
     .option("-n, --limit <number>", "Recent deliveries to inspect", "20")
     .option("--json", "Output as JSON", false)
     .action(async (id: string, opts: { limit?: string; json?: boolean }) => {
+      // `testWebhook` already validates the id; the limit did NOT — and here a
+      // NaN was not even dropped, it was interpolated: the request went out as
+      // `…&limit=NaN`, which the route reads as isNaN → 50, so the health
+      // summary covered a different number of deliveries than was asked for.
+      const limit = parseCountFlag(opts.limit, "-n, --limit", {
+        max: MAX_ROWS.deliveries,
+        consequence: "The request would have gone out as `limit=NaN` and the route would have used 50.",
+      });
       const apiKey = requireApiKey();
       const baseUrl = resolveBaseUrl();
-      const limit = opts.limit ? parseInt(opts.limit, 10) : undefined;
       const health = await testWebhook({ webhookId: id, limit, baseUrl, apiKey });
       if (opts.json) {
         console.log(JSON.stringify(health, null, 2));

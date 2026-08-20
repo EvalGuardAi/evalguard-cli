@@ -3,8 +3,10 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
 import ora from "ora";
 import { getRun, storeRun, generateId, StoredRun } from "./store.js";
+import { boundedFetch, decodeJsonBody } from "../lib/http.js";
 
 export function registerRetry(program: Command): void {
   program
@@ -48,25 +50,15 @@ export function registerRetry(program: Command): void {
       const spinner = ora(`Retrying ${casesToRetry.length} cases...`).start();
 
       try {
-        const { default: fsModule } = await import("fs");
-        const pathModule = await import("path");
-        const osModule = await import("os");
-
-        const configPath = pathModule.join(osModule.homedir(), ".evalguard", "config.json");
-        let config: Record<string, string> = {};
-        if (fsModule.existsSync(configPath)) {
-          config = JSON.parse(fsModule.readFileSync(configPath, "utf-8"));
-        }
-
-        const baseUrl = process.env.EVALGUARD_BASE_URL ?? config.baseUrl ?? "https://evalguard.ai/api/v1";
-        const apiKey = process.env.EVALGUARD_API_KEY ?? config.apiKey;
+        const baseUrl = resolveBaseUrl();
+        const apiKey = resolveApiKey();
 
         if (!apiKey) {
           spinner.fail("Not authenticated. Run `evalguard login` first.");
           process.exit(1);
         }
 
-        const res = await fetch(`${baseUrl}/evals`, {
+        const res = await boundedFetch(`${baseUrl}/evals`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -83,7 +75,7 @@ export function registerRetry(program: Command): void {
           }),
         });
 
-        const data = (await res.json().catch(() => ({ message: res.statusText }))) as Record<string, unknown>;
+        const data = (await decodeJsonBody(res, "retry")) as Record<string, unknown>;
 
         if (!res.ok) {
           throw new Error(`API error ${res.status}: ${data.message ?? "Unknown error"}`);

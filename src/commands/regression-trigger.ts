@@ -18,6 +18,8 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody, expectArray, expectResult, unwrapApiEnvelope } from "../lib/http.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const RISKS = ["low", "medium", "high", "critical"] as const;
@@ -30,7 +32,7 @@ export interface RegressionApiOpts {
 }
 
 async function call(path: string, init: RequestInit, opts: RegressionApiOpts): Promise<unknown> {
-  const f = opts.fetchImpl ?? fetch;
+  const f = opts.fetchImpl ?? boundedFetch;
   const res = await f(`${opts.baseUrl}${path}`, {
     ...init,
     headers: {
@@ -39,7 +41,7 @@ async function call(path: string, init: RequestInit, opts: RegressionApiOpts): P
       ...(init.headers ?? {}),
     },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } } | null)?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
@@ -105,16 +107,20 @@ export async function listRegressionLog(
 }
 
 function envConfig(): RegressionApiOpts {
-  const apiKey = process.env.EVALGUARD_API_KEY;
+  const apiKey = resolveApiKey();
   if (!apiKey) {
     console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`."));
     process.exit(1);
   }
-  return { baseUrl: process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1", apiKey };
+  return { baseUrl: resolveBaseUrl(), apiKey };
 }
 
-function unwrap(body: unknown): unknown {
-  return (body as { data?: unknown } | null)?.data ?? body;
+function unwrap(body: unknown, endpoint = "the regression-trigger API"): unknown {
+  // Delegates to the shared contract. The previous body was
+  // `(body as {data?})?.data ?? body`, whose `?? body` handed the whole envelope
+  // back when `data` was null and passed an unrelated 200 straight through —
+  // the consumer's `?? []` then rendered it as an empty list, exit 0.
+  return unwrapApiEnvelope(body, endpoint);
 }
 
 export function registerRegressionTrigger(program: Command): void {
@@ -139,7 +145,18 @@ export function registerRegressionTrigger(program: Command): void {
             console.error(chalk.red(`--risk must be one of: ${RISKS.join(" | ")}`));
             process.exit(1);
           }
-          const data = unwrap(
+          // Same class as `config get` below, and the same reading: without
+          // required fields, an unrelated 200 renders as
+          // `opted in: no / rerun: no (not fired)` — a definitive "your change
+          // triggered no red-team rerun" produced by falsy `undefined`s.
+          const data = expectResult<{
+            shouldRerun?: boolean;
+            enabled?: boolean;
+            suites?: string[];
+            enqueued?: boolean;
+            triggeredCampaignIds?: string[];
+            reason?: string;
+          }>(
             await fireRegressionTrigger({
               orgId: opts.org,
               projectId: opts.project,
@@ -148,14 +165,9 @@ export function registerRegressionTrigger(program: Command): void {
               resourceId: opts.resource,
               ...envConfig(),
             }),
-          ) as {
-            shouldRerun?: boolean;
-            enabled?: boolean;
-            suites?: string[];
-            enqueued?: boolean;
-            triggeredCampaignIds?: string[];
-            reason?: string;
-          };
+            "POST /regression-tests/trigger",
+            ["shouldRerun", "enabled"],
+          );
           if (opts.json) {
             console.log(JSON.stringify(data, null, 2));
             return;
@@ -186,12 +198,27 @@ export function registerRegressionTrigger(program: Command): void {
     .option("--json", "Output as JSON", false)
     .action(async (opts: { org: string; project: string; json?: boolean }) => {
       try {
-        const data = unwrap(await getRegressionConfig({ orgId: opts.org, projectId: opts.project, ...envConfig() }));
+        // `configured: no (defaults)` / `enabled: no` is a claim that this
+        // project has NO continuous red-team opt-in. Measured before this
+        // change, that exact screen printed with exit 0 for `{"hello":"world"}`
+        // and `{"success":true,"data":{}}` — every line came from the `??`
+        // defaults below, so "not configured" was reported without the server
+        // ever saying so. `configured` + `enabled` are what make the body this
+        // route's answer.
+        const c = expectResult<{
+          enabled?: boolean;
+          min_risk_level?: string;
+          trigger_change_types?: string[] | null;
+          configured?: boolean;
+        }>(
+          await getRegressionConfig({ orgId: opts.org, projectId: opts.project, ...envConfig() }),
+          "GET /regression-trigger/config",
+          ["configured", "enabled"],
+        );
         if (opts.json) {
-          console.log(JSON.stringify(data, null, 2));
+          console.log(JSON.stringify(c, null, 2));
           return;
         }
-        const c = data as { enabled?: boolean; min_risk_level?: string; trigger_change_types?: string[] | null; configured?: boolean };
         console.log(`  ${chalk.dim("configured:  ")} ${c.configured ? "yes" : chalk.dim("no (defaults)")}`);
         console.log(`  ${chalk.dim("enabled:     ")} ${c.enabled ? chalk.green("yes") : chalk.yellow("no")}`);
         console.log(`  ${chalk.dim("min risk:    ")} ${c.min_risk_level ?? "medium"}`);
@@ -265,7 +292,17 @@ export function registerRegressionTrigger(program: Command): void {
     .action(async (opts: { org: string; project: string; limit?: string; json?: boolean }) => {
       try {
         const limit = opts.limit ? Math.max(1, Math.min(200, parseInt(opts.limit, 10) || 50)) : 50;
-        const data = unwrap(await listRegressionLog({ orgId: opts.org, projectId: opts.project, limit, ...envConfig() })) as Array<{
+        // `!Array.isArray(data)` used to fall into the SAME branch as an
+        // empty list, so a 200 carrying an unrelated object printed the empty
+        // state and exited 0 (measured 2026-08-08). expectArray separates
+        // "not a list" from "an empty list"; the latter is still fine.
+        const data = expectArray(
+          unwrap(
+            await listRegressionLog({ orgId: opts.org, projectId: opts.project, limit, ...envConfig() }),
+            "GET /regression-tests/log",
+          ),
+          "GET /regression-tests/log",
+        ) as Array<{
           created_at: string;
           change_type: string;
           risk_level: string;

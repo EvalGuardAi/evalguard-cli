@@ -9,27 +9,55 @@
  *                                       [--out=<path>]
  *
  * Hits GET /api/v1/ai-sbom?projectId=<id>&format=<f> with the user's API
- * key from EVALGUARD_API_KEY. Writes the raw response body to disk
- * (CycloneDX 1.6 / SPDX 2.3 / EvalGuard-native JSON depending on format).
+ * key from EVALGUARD_API_KEY. Writes the response document to disk.
  *
- * No client-side schema validation — the server is canonical; the CLI just
- * streams whatever it gets back. If the server returns 4xx/5xx, we print
- * the error body and exit non-zero so the file isn't half-written.
+ * ─── 2026-08-09: the body is VALIDATED before it becomes a file ────────────
+ *
+ * This header used to read "No client-side schema validation — the server is
+ * canonical; the CLI just streams whatever it gets back." Measured against the
+ * built CLI, that policy produced these, each written to disk as a CycloneDX
+ * SBOM, each with exit 0:
+ *
+ *     ✓ Wrote 27 bytes …   body was `this is not JSON at all {{{`
+ *     ✓ Wrote 0 bytes …    body was empty (and again for a 204)
+ *     ✓ Wrote 4 bytes …    body was `null`
+ *     ✓ Wrote 157 bytes …  body was an nginx 502 error page
+ *     ✓ Wrote 2097152 …    body was 2 MB of filler
+ *
+ * — followed by `• Validate: cyclonedx validate --input-file <that file>`.
+ *
+ * "The server is canonical" is a statement about SCHEMA authority. It is not a
+ * reason to accept bytes that demonstrably did not come from the server's SBOM
+ * generator: 10 of 14 fault modes were indistinguishable from a successful
+ * export. `readArtifactBody` (lib/http.ts) now proves the document is the
+ * AI-BOM route's answer, in the format that was REQUESTED, before any file is
+ * created — and no file is created when it is not.
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
 import * as fs from "fs";
 import * as path from "path";
 import { enrichWithReputation, highReputationRisk } from "@evalguard/core";
+import {
+  AI_BOM_FORMATS,
+  AI_BOM_MARKERS,
+  type AiBomFormat,
+  boundedFetch,
+  decodeJsonBody,
+  isAiBomFormat,
+  readArtifactBody,
+  readErrorDetail,
+} from "../lib/http.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function baseUrl(): string {
-  return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  return resolveBaseUrl();
 }
 
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) {
     console.error(
       chalk.red("EVALGUARD_API_KEY is not set. Run `evalguard init` first or export the key."),
@@ -46,7 +74,7 @@ function apiKey(): string {
  */
 export async function fetchAiBom(opts: {
   projectId: string;
-  format: "cyclonedx" | "spdx" | "json";
+  format: AiBomFormat;
   baseUrl: string;
   apiKey: string;
   fetchImpl?: typeof fetch;
@@ -54,7 +82,7 @@ export async function fetchAiBom(opts: {
   if (!UUID_RE.test(opts.projectId)) {
     throw new Error(`projectId must be a valid v4 UUID. Got: ${opts.projectId}`);
   }
-  const fetchFn = opts.fetchImpl ?? fetch;
+  const fetchFn = opts.fetchImpl ?? boundedFetch;
   const url = `${opts.baseUrl}/ai-sbom?projectId=${encodeURIComponent(opts.projectId)}&format=${opts.format}`;
   const res = await fetchFn(url, {
     method: "GET",
@@ -64,20 +92,18 @@ export async function fetchAiBom(opts: {
     },
   });
   if (!res.ok) {
-    let detail = "";
-    try {
-      const j = (await res.json()) as { error?: { message?: string; code?: string } };
-      detail = ` (${j.error?.code ?? "ERROR"}: ${j.error?.message ?? "unknown"})`;
-    } catch {
-      try {
-        detail = ` — ${await res.text()}`.slice(0, 400);
-      } catch {
-        // best-effort body capture
-      }
-    }
-    throw new Error(`AI-BOM export failed: HTTP ${res.status}${detail}`);
+    throw new Error(`AI-BOM export failed: HTTP ${res.status}${await readErrorDetail(res)}`);
   }
-  const body = await res.text();
+  // FAIL CLOSED: prove these bytes are the AI-BOM route's document, in the
+  // format that was asked for, BEFORE anyone can write them to disk. Throws
+  // `IndeterminateResponseError` otherwise, which the action handler reports
+  // and exits 1 on — with no file created.
+  const body = await readArtifactBody(res, {
+    endpoint: `GET /ai-sbom?format=${opts.format}`,
+    format: "ai-bom",
+    contract: AI_BOM_MARKERS[opts.format],
+    what: "AI-BOM",
+  });
   // Suggest a filename based on the Content-Disposition header if present.
   const cd = res.headers.get("content-disposition") ?? "";
   const m = cd.match(/filename="([^"]+)"/);
@@ -173,7 +199,7 @@ export async function runSbomScan(opts: {
   apiKey: string;
   fetchImpl?: typeof fetch;
 }): Promise<SbomScanResult> {
-  const fetchFn = opts.fetchImpl ?? fetch;
+  const fetchFn = opts.fetchImpl ?? boundedFetch;
   const res = await fetchFn(`${opts.baseUrl}/ai-sbom/generate`, {
     method: "POST",
     headers: {
@@ -188,16 +214,16 @@ export async function runSbomScan(opts: {
     }),
   });
   if (!res.ok) {
-    let detail = "";
-    try {
-      const j = (await res.json()) as { error?: { message?: string; code?: string } };
-      detail = ` (${j.error?.code ?? "ERROR"}: ${j.error?.message ?? "unknown"})`;
-    } catch {
-      // best-effort body capture
-    }
+    const j = (await decodeJsonBody(res, "POST /ai-sbom/generate")) as {
+      error?: { message?: string; code?: string };
+    } | null;
+    const detail = j?.error ? ` (${j.error.code ?? "ERROR"}: ${j.error.message ?? "unknown"})` : "";
     throw new Error(`Supply-chain scan failed: HTTP ${res.status}${detail}`);
   }
-  const body = (await res.json()) as {
+  // Through the boundary rather than a bare `res.json()`: an empty body, a 204,
+  // a bare `null` and a bare primitive are refused here instead of arriving as
+  // `null` and being read for `.data`.
+  const body = (await decodeJsonBody(res, "POST /ai-sbom/generate")) as {
     data?: {
       bom?: { vulnerabilities?: SbomScanFinding[] };
       supplyChain?: Omit<SbomScanResult, "vulnerabilities">;
@@ -235,16 +261,22 @@ export function registerAiBom(program: Command): void {
     .command("export")
     .description("Export a project's AI-BOM as CycloneDX / SPDX / native JSON")
     .argument("<projectId>", "Project UUID (visible on the project settings page)")
-    .option("-f, --format <fmt>", "Export format: cyclonedx | spdx | json", "cyclonedx")
+    .option("-f, --format <fmt>", `Export format: ${AI_BOM_FORMATS.join(" | ")}`, "cyclonedx")
     .option("-o, --out <path>", "Output file path (default: ./evalguard-ai-bom-<id>.<ext>)")
     .action(
       async (
         projectId: string,
         opts: { format: string; out?: string },
       ) => {
+        // Parsed against `AI_BOM_FORMATS`, which is also what `AI_BOM_MARKERS`
+        // is keyed by — so the formats this command ADVERTISES and the formats
+        // that have a validation contract are one list, and a fourth cannot be
+        // accepted here without one existing.
         const fmt = opts.format.toLowerCase();
-        if (fmt !== "cyclonedx" && fmt !== "spdx" && fmt !== "json") {
-          console.error(chalk.red(`Unknown format: ${opts.format}. Choose: cyclonedx | spdx | json`));
+        if (!isAiBomFormat(fmt)) {
+          console.error(
+            chalk.red(`Unknown format: ${opts.format}. Choose: ${AI_BOM_FORMATS.join(" | ")}`),
+          );
           process.exit(1);
         }
         console.log();
@@ -259,7 +291,7 @@ export function registerAiBom(program: Command): void {
         try {
           result = await fetchAiBom({
             projectId,
-            format: fmt as "cyclonedx" | "spdx" | "json",
+            format: fmt,
             baseUrl: baseUrl(),
             apiKey: apiKey(),
           });
@@ -275,9 +307,37 @@ export function registerAiBom(program: Command): void {
         console.log();
         console.log(chalk.bold("  Next steps:"));
         if (fmt === "cyclonedx") {
-          console.log(`    • Validate: ${chalk.cyan("cyclonedx validate --input-file " + path.basename(outputPath))}`);
+          // `--fail-on-errors` is NOT optional polish. Measured on
+          // cyclonedx-cli 0.33.1 against a deliberately non-conformant BOM
+          // (`components` an object, an extra root key):
+          //
+          //   $ cyclonedx validate --input-file bad.cdx.json
+          //     Value is "object" but should be "array"
+          //     All values fail against the false schema
+          //     BOM is not valid.
+          //   $ echo $?
+          //     0                        ← without the flag
+          //   $ cyclonedx validate --input-file bad.cdx.json --fail-on-errors
+          //     … BOM is not valid.
+          //   $ echo $?
+          //     1                        ← with it
+          //
+          // A customer who pastes our printed command into a CI job gets a step
+          // that prints "BOM is not valid." and then goes green — the pipeline
+          // cannot fail, which is the same fail-OPEN defect this whole module
+          // exists to close, just relocated into the customer's pipeline. The
+          // flag costs nothing on a valid document: the same tool exits 0 on
+          // the route's real export with and without it.
+          console.log(
+            `    • Validate: ${chalk.cyan("cyclonedx validate --fail-on-errors --input-file " + path.basename(outputPath))}`,
+          );
           console.log(`    • Spec: https://cyclonedx.org/specification/overview/`);
         } else if (fmt === "spdx") {
+          // No equivalent flag is needed here, and that was measured rather
+          // than assumed: `pyspdxtools` (spdx-tools 0.8.x) validates by default
+          // and exits NON-ZERO when it fails — 0 + silent on the route's real
+          // SPDX 2.3 export, 1 + "The document is invalid" on a broken one. The
+          // weak-command defect is specific to `cyclonedx validate`.
           console.log(`    • Validate: ${chalk.cyan("pyspdxtools --infile " + path.basename(outputPath))}`);
           console.log(`    • Spec: https://spdx.dev/specifications/`);
         }

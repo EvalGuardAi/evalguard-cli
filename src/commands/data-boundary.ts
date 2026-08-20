@@ -15,8 +15,21 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import {
+  boundedFetch,
+  decodeJsonBody,
+  expectArrayField,
+  expectBooleanField,
+  expectField,
+  expectResult,
+} from "../lib/http.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const ENDPOINT_LIST = "GET /data-boundary";
+const ENDPOINT_SET = "POST /data-boundary";
+const ENDPOINT_EVAL = "POST /data-boundary/evaluate";
 const BOUNDARIES = ["user-can-see", "workflow-can-use", "model-can-receive", "output-can-reveal"] as const;
 type Boundary = (typeof BOUNDARIES)[number];
 
@@ -27,12 +40,12 @@ export interface DataBoundaryApiOpts {
 }
 
 async function call(path: string, init: RequestInit, opts: DataBoundaryApiOpts): Promise<unknown> {
-  const f = opts.fetchImpl ?? fetch;
+  const f = opts.fetchImpl ?? boundedFetch;
   const res = await f(`${opts.baseUrl}${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${opts.apiKey}`, "content-type": "application/json", ...(init.headers ?? {}) },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } } | null)?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
@@ -114,12 +127,12 @@ export async function evaluateDataBoundary(
 }
 
 function envConfig(): DataBoundaryApiOpts {
-  const apiKey = process.env.EVALGUARD_API_KEY;
+  const apiKey = resolveApiKey();
   if (!apiKey) {
     console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`."));
     process.exit(1);
   }
-  return { baseUrl: process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1", apiKey };
+  return { baseUrl: resolveBaseUrl(), apiKey };
 }
 
 export function registerDataBoundary(program: Command): void {
@@ -134,14 +147,22 @@ export function registerDataBoundary(program: Command): void {
     .option("--json", "Output as JSON", false)
     .action(async (opts: { org: string; json?: boolean }) => {
       try {
-        const body = (await getDataBoundaryPolicies({ orgId: opts.org, ...envConfig() })) as {
-          data?: { policies: { id: string; name: string; enabled: boolean }[]; total: number };
-        };
-        const result = body.data ?? (body as unknown as { policies: { id: string; name: string; enabled: boolean }[]; total: number });
+        const body = await getDataBoundaryPolicies({ orgId: opts.org, ...envConfig() });
+        // "No data-boundary policies." is a statement that the org has NO
+        // data-exposure controls configured, which a reviewer acts on. It was
+        // printed with exit 0 for `{"hello":"world"}`, `{"success":true,"data":null}`,
+        // `{"success":true,"data":{}}` and an explicit `success:false` error
+        // envelope, because `result.policies?.length` reads a missing list as an
+        // empty one. `expectArrayField` separates "the server sent []" from
+        // "the server never mentioned policies".
+        const result = expectResult(body, ENDPOINT_LIST);
+        const policies = expectArrayField(result, "policies", ENDPOINT_LIST) as {
+          id: string; name: string; enabled: boolean;
+        }[];
         if (opts.json) return void console.log(JSON.stringify(result, null, 2));
-        if (!result.policies?.length) return void console.log(chalk.dim("  No data-boundary policies."));
-        console.log(chalk.bold(`\n  ${result.total} data-boundary policy(ies)\n`));
-        for (const p of result.policies) {
+        if (policies.length === 0) return void console.log(chalk.dim("  No data-boundary policies."));
+        console.log(chalk.bold(`\n  ${policies.length} data-boundary policy(ies)\n`));
+        for (const p of policies) {
           const state = p.enabled ? chalk.green("enabled") : chalk.dim("disabled");
           console.log(`  • ${p.name} ${chalk.dim(`(${p.id})`)} — ${state}`);
         }
@@ -172,15 +193,19 @@ export function registerDataBoundary(program: Command): void {
           }
           boundaryRules = parsed as Record<string, unknown>;
         }
-        const body = (await setDataBoundaryPolicy({
+        const body = await setDataBoundaryPolicy({
           orgId: opts.org,
           name: opts.name,
           projectId: opts.project,
           boundaryRules,
           enabled: !opts.disabled,
           ...envConfig(),
-        })) as { data?: { policy: { id: string; name: string } } };
-        const policy = body.data?.policy ?? (body as unknown as { policy: { id: string; name: string } }).policy;
+        });
+        const policy = expectResult(
+          expectField(expectResult(body, ENDPOINT_SET), "policy", ENDPOINT_SET),
+          ENDPOINT_SET,
+          ["id", "name"],
+        ) as { id: string; name: string };
         if (opts.json) return void console.log(JSON.stringify(policy, null, 2));
         console.log(chalk.green(`  ✓ Saved data-boundary policy "${policy.name}" (${policy.id})`));
       } catch (e) {
@@ -211,7 +236,7 @@ export function registerDataBoundary(program: Command): void {
         if (!BOUNDARIES.includes(opts.boundary as Boundary)) {
           throw new Error(`--boundary must be one of: ${BOUNDARIES.join(", ")}`);
         }
-        const body = (await evaluateDataBoundary({
+        const body = await evaluateDataBoundary({
           orgId: opts.org,
           boundary: opts.boundary as Boundary,
           policyName: opts.policy,
@@ -222,10 +247,20 @@ export function registerDataBoundary(program: Command): void {
           action: opts.action,
           agentClientId: opts.agentClientId,
           ...envConfig(),
-        })) as { data?: { decision: { allow: boolean; reason: string; redactions?: unknown[]; classification: string } } };
-        const decision = body.data?.decision ?? (body as unknown as { decision: { allow: boolean; reason: string; redactions?: unknown[]; classification: string } }).decision;
+        });
+        // An ALLOW/DENY on a data-exposure boundary. `decision.allow` being
+        // `undefined` renders as DENY, which looks safe and is not — it means
+        // the policy was never consulted. Refuse instead.
+        const decision = expectResult<{
+          allow: boolean; reason: string; redactions?: unknown[]; classification: string;
+        }>(
+          expectField(expectResult(body, ENDPOINT_EVAL), "decision", ENDPOINT_EVAL),
+          ENDPOINT_EVAL,
+          ["reason", "classification"],
+        );
+        const allow = expectBooleanField(decision, "allow", ENDPOINT_EVAL);
         if (opts.json) return void console.log(JSON.stringify(decision, null, 2));
-        const verdict = decision.allow ? chalk.green("ALLOW") : chalk.red("DENY");
+        const verdict = allow ? chalk.green("ALLOW") : chalk.red("DENY");
         console.log(`\n  ${verdict} ${chalk.dim(`[${opts.boundary}]`)} classification=${decision.classification}`);
         console.log(`  ${chalk.dim(decision.reason)}`);
         if (decision.redactions?.length) console.log(chalk.yellow(`  ${decision.redactions.length} span(s) redacted`));

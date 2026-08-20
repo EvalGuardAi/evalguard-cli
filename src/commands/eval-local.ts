@@ -39,6 +39,16 @@ interface LocalEvalConfig {
      * never collides with another case's value in the shared scorerOptions map.
      */
     caseScorerOptions?: Record<string, Record<string, unknown>>;
+    /**
+     * The scorers scoped to THIS case: the run-level global scorers unioned
+     * with the scorer names from this case's OWN `assert:`/`scorers:` block.
+     * When present, the eval runs ONLY these scorers against this case instead
+     * of the union of every case's assert types — so a `contains` assert on
+     * case A never runs (and phantom-fails) against case B which declared
+     * `equals`. Undefined = fall back to the run-level `scorers` (the common
+     * no-per-case-assert path, byte-for-byte unchanged).
+     */
+    caseScorers?: string[];
   }[];
   scorerOptions?: Record<string, Record<string, unknown>>;
   /**
@@ -84,7 +94,7 @@ export function registerEvalLocal(program: Command): void {
           else if (fs.existsSync(ymlPath)) file = ymlPath;
           else if (fs.existsSync(jsonPath)) file = jsonPath;
           else {
-            spinner.fail("No evalguard.yaml found. Run `npx evalguard init` to create one.");
+            spinner.fail("No evalguard.yaml found. Run `npx @evalguard/cli init` to create one.");
             process.exit(1);
           }
         }
@@ -191,15 +201,28 @@ export function registerEvalLocal(program: Command): void {
             };
             transformRunner = mod.quickjsTransformRunner;
           } catch {
+            // DO NOT tell people to install this package.
+            //
+            // Verified 2026-08-10 against the public registry:
+            //   GET https://registry.npmjs.org/@evalguard%2fquickjs-runner → 404
+            //   GET https://registry.npmjs.org/@evalguard%2fcli            → 200
+            //
+            // `@evalguard/quickjs-runner` is a workspace package that has never
+            // been published, so "Install: pnpm add @evalguard/quickjs-runner"
+            // sent every user with a `transform:` in their YAML to a dead end
+            // and made the tool look broken rather than the instruction. Say
+            // what is true instead; an honest "not available" beats an
+            // actionable-looking command that cannot succeed.
             spinner.warn(
-              "Eval YAML uses `transform:` but @evalguard/quickjs-runner is not installed. " +
-                "Cases with transforms will fail with a helpful error. " +
-                "Install: pnpm add @evalguard/quickjs-runner",
+              "Eval YAML uses `transform:` but the QuickJS transform runner is not available in this " +
+                "install, so those cases will fail with a per-case error. " +
+                "@evalguard/quickjs-runner is not published to npm yet — remove `transform:` from the " +
+                "affected cases, or run from a workspace checkout where the package is linked.",
             );
           }
         }
 
-        const result = await runEvaluation({
+        const result = await runScopedEvaluation(runEvaluation, {
           model,
           prompt: config.prompt,
           cases: config.cases,
@@ -207,8 +230,8 @@ export function registerEvalLocal(program: Command): void {
           callLLM,
           scorerOptions: config.scorerOptions,
           cache: opts.cache !== false,
-          ...(transformRunner ? { transformRunner } : {}),
-          ...(opts.concurrency ? { concurrency: opts.concurrency } : {}),
+          transformRunner,
+          concurrency: opts.concurrency,
         });
 
         spinner.stop();
@@ -245,7 +268,7 @@ export function registerEvalLocal(program: Command): void {
         console.log();
 
         if (opts.verbose) {
-          for (const c of result.cases) {
+          for (const c of result.cases as any[]) {
             const icon = c.passed ? chalk.green("✓") : chalk.red("✗");
             console.log(`  ${icon} ${chalk.dim(c.input.slice(0, 60))}${c.input.length > 60 ? "..." : ""}`);
             console.log(`    Output: ${chalk.dim(c.actualOutput.slice(0, 80))}${c.actualOutput.length > 80 ? "..." : ""}`);
@@ -277,6 +300,145 @@ export function registerEvalLocal(program: Command): void {
         process.exit(1);
       }
     });
+}
+
+/** Minimal shape of the case objects `runScopedEvaluation` reads/threads.
+ *  Exported so callers (e.g. `gate`) can type the cases they hand the runner. */
+export interface ScopedCase {
+  input?: string;
+  caseScorers?: string[];
+  score?: number;
+  passed?: boolean;
+  latency?: number;
+  tokenUsage?: { total?: number };
+  scorerResults?: Record<string, unknown>;
+}
+
+interface ScopedEvalBase {
+  model: string;
+  prompt: string;
+  cases: ScopedCase[];
+  /** Run-level (global) scorers — the fallback set for cases with no own asserts. */
+  scorers: string[];
+  callLLM: (prompt: string) => Promise<string>;
+  scorerOptions?: Record<string, Record<string, unknown>>;
+  cache?: boolean;
+  transformRunner?: unknown;
+  concurrency?: number;
+}
+
+interface ScopedEvalResult {
+  cases: ScopedCase[];
+  score: number;
+  maxScore: number;
+  passRate: number;
+  totalLatency: number;
+  totalTokens: number;
+  cacheHits?: number;
+}
+
+/**
+ * Run `runEvaluation` with PER-CASE scorer scoping.
+ *
+ * Each case is scored with ONLY the scorers from its own `assert:`/`scorers:`
+ * block (unioned with the run-level global scorers, exposed on the case as
+ * `caseScorers`) — NOT the union of every case's assert types. Cases that share
+ * an identical effective scorer set are batched into a single `runEvaluation`
+ * call, so the scoring engine's per-run behaviour and the eval cache are
+ * preserved exactly; the common single-set config takes the original one-call
+ * fast path unchanged.
+ *
+ * Why this exists: `normaliseConfig` used to fold every case's `assert:` block
+ * into ONE global scorer list that ran against EVERY case. A case that declared
+ * only `contains` also got `equals` run against it → a phantom
+ * `0.00 "No expected string provided"`, deflating the score (and vice-versa).
+ * Scoping each case to its own scorer set removes those cross-applied phantoms.
+ *
+ * Exported for unit testing (the CLI `.action()` closure calls `process.exit`).
+ */
+export async function runScopedEvaluation(
+  // `runEvaluation` is `@evalguard/core`'s strongly-typed runner; the CLI treats
+  // core as loosely-typed (see `core as any` in the action), so accept any
+  // config-shaped input and only pin the result shape this helper depends on.
+  runEvaluation: (cfg: any) => Promise<ScopedEvalResult>,
+  base: ScopedEvalBase,
+): Promise<ScopedEvalResult> {
+  const cases = base.cases;
+
+  // The scorer set actually applied to case `i`: its own `caseScorers` when the
+  // config attached one (an explicit array — even empty — is authoritative and
+  // means "score this case with exactly these"), otherwise the run-level set.
+  const effectiveScorers = (i: number): string[] => {
+    const own = cases[i]?.caseScorers;
+    return Array.isArray(own) ? own : base.scorers;
+  };
+
+  // Group case indices by a stable signature of their effective scorer set.
+  const groups = new Map<string, number[]>();
+  for (let i = 0; i < cases.length; i++) {
+    const sig = [...effectiveScorers(i)].sort().join("\u0000");
+    const bucket = groups.get(sig);
+    if (bucket) bucket.push(i);
+    else groups.set(sig, [i]);
+  }
+
+  const buildRunConfig = (
+    groupCases: ScopedCase[],
+    scorers: string[],
+  ): Record<string, unknown> => ({
+    model: base.model,
+    prompt: base.prompt,
+    cases: groupCases,
+    scorers,
+    callLLM: base.callLLM,
+    scorerOptions: base.scorerOptions,
+    cache: base.cache,
+    ...(base.transformRunner ? { transformRunner: base.transformRunner } : {}),
+    ...(base.concurrency ? { concurrency: base.concurrency } : {}),
+  });
+
+  // Fast path: every case shares one scorer set → single `runEvaluation` call,
+  // byte-for-byte identical to the legacy behaviour (incl. statistics/repetition
+  // rollups, which only make sense within a single run). Use the shared group's
+  // effective set — which equals `base.scorers` for the common no-per-case path,
+  // but is precise when all cases pin the same explicit set.
+  if (groups.size <= 1) {
+    const only = cases.length > 0 ? effectiveScorers(0) : base.scorers;
+    return runEvaluation(buildRunConfig(cases, only));
+  }
+
+  // Multi-set path: one `runEvaluation` per distinct scorer set, then reassemble
+  // the case results in ORIGINAL order and recompute the run-level aggregates
+  // over all cases.
+  const ordered: ScopedCase[] = new Array(cases.length);
+  let cacheHitsTotal = 0;
+  for (const indices of groups.values()) {
+    const groupScorers = effectiveScorers(indices[0]);
+    const groupCases = indices.map((i) => cases[i]);
+    const r = await runEvaluation(buildRunConfig(groupCases, groupScorers));
+    indices.forEach((origIdx, k) => {
+      ordered[origIdx] = r.cases[k];
+    });
+    cacheHitsTotal += r.cacheHits ?? 0;
+  }
+
+  const passedCount = ordered.filter((c) => c.passed).length;
+  const totalScore = ordered.reduce((s, c) => s + (c.score ?? 0), 0);
+  const totalLatency = ordered.reduce((s, c) => s + (c.latency ?? 0), 0);
+  const totalTokens = ordered.reduce(
+    (s, c) => s + (c.tokenUsage?.total ?? 0),
+    0,
+  );
+
+  return {
+    cases: ordered,
+    score: totalScore,
+    maxScore: ordered.length,
+    passRate: ordered.length > 0 ? passedCount / ordered.length : 0,
+    totalLatency,
+    totalTokens,
+    cacheHits: cacheHitsTotal > 0 ? cacheHitsTotal : undefined,
+  };
 }
 
 function detectProvider(model: string): string {
@@ -381,8 +543,8 @@ export function normaliseConfig(raw: any): LocalEvalConfig {
   // The `type` key is the Promptfoo / `evalguard init` `assert:` shape
   // (`{type: "llm-rubric", value: "..."}`). Promptfoo names its assertion
   // types differently from EvalGuard's scorer registry (e.g. `llm-rubric`
-  // is `llm-grader` here, `model-graded-fact` is `factuality`, `is-json`
-  // is `json-valid`). We map `type`-keyed entries through the canonical
+  // is `llm-grader` here, `model-graded-factuality` is `factuality`,
+  // `is-json` is `json-valid`). We map `type`-keyed entries through the canonical
   // ASSERTION_MAP so they resolve to real scorers instead of triggering an
   // "Unknown scorers" warning and being dropped. A `{scorer}`/`{name}`
   // entry or a bare string is ALREADY an EvalGuard scorer name — leave it
@@ -390,7 +552,8 @@ export function normaliseConfig(raw: any): LocalEvalConfig {
   //
   // A handful of Promptfoo types (the ASSERTION_SUGGESTIONS set) can't
   // become a built-in scorer at all — arbitrary `javascript`/`python`
-  // code, `webhook`, and the `rouge`/`bleu` reference-overlap metrics.
+  // code, plus `classifier`, `moderation` and `perplexity-score`.
+  // (`webhook`, `bleu` and `rouge-n` do have built-ins and are mapped.)
   // These are recorded in `skippedAssertions` (so the caller can warn) and
   // excluded from the scorer list — they can't execute, but the user is
   // TOLD rather than left wondering why their assertion vanished.
@@ -432,18 +595,34 @@ export function normaliseConfig(raw: any): LocalEvalConfig {
   // `defaultTest.assert` and per-case `assert:` blocks (init / Promptfoo
   // style). Without harvesting from `assert:` we'd run zero scorers when
   // the user followed `init`.
-  const perCaseAsserts: unknown[] = (Array.isArray(raw.cases) ? raw.cases : [])
-    .flatMap((c: any) => (Array.isArray(c?.assert) ? c.assert : []));
-  const scorers = Array.from(
+  // GLOBAL scorers apply to EVERY case: top-level `scorers`/`defaultScorers`
+  // and Promptfoo's `defaultTest.assert`. A per-case `assert:`/`scorers:` block
+  // is scoped to ITS OWN case (see `caseScorers` on each mapped case) and must
+  // NOT leak onto sibling cases — that leak is what produced the phantom
+  // `0.00 "No expected string provided"` on cases that never declared the type.
+  const globalScorers = Array.from(
     new Set(
       flattenScorers(raw.defaultScorers)
         .concat(flattenScorers(raw.scorers))
-        .concat(flattenScorers(defaultAsserts))
-        .concat(flattenScorers(perCaseAsserts)),
+        .concat(flattenScorers(defaultAsserts)),
     ),
   );
+  // Every per-case `assert:`/`scorers:` entry, flattened — used ONLY to build
+  // the top-level UNION `scorers` list (for the run banner, `validate`, and the
+  // stored run summary). The actual run scopes scorers per case via
+  // `caseScorers`, so a scorer in this union never runs against a case that
+  // didn't declare it.
+  const perCaseAsserts: unknown[] = (Array.isArray(raw.cases) ? raw.cases : [])
+    .flatMap((c: any) =>
+      (Array.isArray(c?.assert) ? c.assert : []).concat(
+        Array.isArray(c?.scorers) ? c.scorers : [],
+      ),
+    );
+  const scorers = Array.from(
+    new Set(globalScorers.concat(flattenScorers(perCaseAsserts))),
+  );
 
-  // Carry scorer options through — Promptfoo-style `value:` config is what
+  // Carry scorer options through — the `value:` config on a scorer is what
   // makes `contains-any`, `not-contains`, etc. actually check anything.
   // Dropping it (as we were doing) made every scorer score 0.
   //
@@ -644,6 +823,28 @@ export function normaliseConfig(raw: any): LocalEvalConfig {
     // text ONLY from `ctx.expected`, so a per-case value for those rides on the
     // case's `expectedOutput` instead of `caseScorerOptions`.
     const perCaseExpected = perCaseExpectedFrom(c?.assert, c?.scorers);
+    // Scorers scoped to THIS case: the run-level global scorers unioned with the
+    // scorer names from this case's OWN `assert:`/`scorers:` block. Threaded to
+    // the runner (via `runScopedEvaluation`) so each case is scored with only
+    // its own types — a `contains` assert on one case never runs (and phantom-
+    // fails) against a sibling that declared `equals`. A case with no own
+    // asserts gets exactly the GLOBAL scorers (not the union), so it never
+    // inherits a sibling's per-case type either.
+    const caseOwnScorers = flattenScorers(
+      ([] as unknown[])
+        .concat(Array.isArray(c?.assert) ? c.assert : [])
+        .concat(Array.isArray(c?.scorers) ? c.scorers : []),
+    );
+    const mergedCaseScorers = Array.from(
+      new Set(globalScorers.concat(caseOwnScorers)),
+    );
+    // Attach an explicit per-case set for EVERY case as soon as ANY case in the
+    // config carries its own `assert:`/`scorers:` block. A case with no own
+    // asserts then runs exactly the GLOBAL scorers (possibly none) rather than
+    // inheriting a sibling's per-case type via the run-level union. When NO case
+    // has per-case asserts, leave it undefined so the runner keeps the legacy
+    // single-set fast path (byte-for-byte unchanged).
+    const caseScorers = hasPerCaseAsserts ? mergedCaseScorers : undefined;
 
     if (c && typeof c === "object" && typeof c.input === "string") {
       return {
@@ -654,9 +855,10 @@ export function normaliseConfig(raw: any): LocalEvalConfig {
         transform: transformCode,
         vars: c?.vars ? stringifyVarValues(c.vars as Record<string, unknown>) : undefined,
         caseScorerOptions,
+        caseScorers,
       };
     }
-    // Promptfoo-style: { vars: {query: "..."}, scorers?: [...] }
+    // Case shape: { vars: {query: "..."}, scorers?: [...] }
     const vars = (c?.vars ?? {}) as Record<string, unknown>;
     const hasTemplateVars = /\{\{\s*[a-zA-Z0-9_]+\s*\}\}/.test(prompt);
     // If prompt has {{name}} placeholders, interpolate vars directly and use
@@ -674,6 +876,7 @@ export function normaliseConfig(raw: any): LocalEvalConfig {
       transform: transformCode,
       vars: stringifyVarValues(vars),
       caseScorerOptions,
+      caseScorers,
     };
   });
 

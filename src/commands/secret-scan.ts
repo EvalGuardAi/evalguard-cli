@@ -1,7 +1,7 @@
 /**
  * `evalguard secret-scan [path]` — G10.
  *
- * Gitleaks-style detection of committed secrets (API keys, private keys,
+ * Signature-based detection of committed secrets (API keys, private keys,
  * cloud/SaaS tokens) by scanning repo file CONTENTS. Walks the target dir
  * with core's repo walker, runs the curated secret rules over every file,
  * and reports findings as human-readable text (default), JSON, or SARIF
@@ -22,6 +22,7 @@ import chalk from "chalk";
 import * as fs from "fs";
 import * as path from "path";
 import { execFileSync } from "child_process";
+import { parseSeverityGate, severityRank } from "../lib/gate-threshold.js";
 
 type Severity = "low" | "medium" | "high" | "critical";
 
@@ -31,6 +32,41 @@ const SEVERITY_RANK: Record<Severity, number> = {
   high: 2,
   critical: 3,
 };
+
+/**
+ * Decide whether a secret-scan run should FAIL (exit 1) given its reported
+ * findings + gate settings. Pure and exported for testing.
+ *
+ * Gating is ON by DEFAULT at "high" (parity with iac-scan / code-scan) so a bare
+ * `secret-scan` in CI actually blocks on committed secrets — the previous default
+ * silently exited 0. `failOnSecret` (back-compat) gates on ANY reported secret
+ * (down to `minSeverity`); `failOn === "none"` disables gating (report-only).
+ */
+export function resolveSecretScanGate(
+  reported: readonly { severity: Severity }[],
+  minSeverity: Severity,
+  failOn: string,
+  failOnSecret: boolean,
+): { shouldFail: boolean; gatedCount: number; gateLabel: string } {
+  const fo = (failOn ?? "high").toLowerCase().trim();
+  // `severityRank` is a Map lookup and `?? 0` is a FAIL-CLOSED default (gate
+  // everything), which is the whole difference from what shipped:
+  // `SEVERITY_RANK[fo] ?? SEVERITY_RANK.high` did NOT fall back for a prototype
+  // key — `SEVERITY_RANK["constructor"]` is the Object constructor, truthy and
+  // non-nullish — so `gateRank` became a function, every
+  // `SEVERITY_RANK[f.severity] >= gateRank` was a NaN comparison, `gatedCount`
+  // was 0, and `secret-scan --fail-on constructor` exited 0 over committed
+  // credentials. See lib/gate-threshold.ts; the flag parser rejects it too, and
+  // this is the second line so a direct caller of this exported helper cannot
+  // reintroduce the hole.
+  const gateRank = failOnSecret
+    ? severityRank(minSeverity) ?? 0
+    : fo === "none"
+      ? Number.POSITIVE_INFINITY
+      : severityRank(fo) ?? 0;
+  const gatedCount = reported.filter((f) => (severityRank(f.severity) ?? 0) >= gateRank).length;
+  return { shouldFail: gatedCount > 0, gatedCount, gateLabel: failOnSecret ? minSeverity : fo };
+}
 
 const SEVERITY_COLOR: Record<Severity, (s: string) => string> = {
   low: chalk.gray,
@@ -145,13 +181,18 @@ export function registerSecretScan(program: Command): void {
       "Write SARIF 2.1.0 findings to <file> (for GitHub Code Scanning upload)",
     )
     .option(
+      "--fail-on <severity>",
+      "Exit 1 if any finding ≥ this severity (low|medium|high|critical), or 'none' to disable gating. Gates on high+ by DEFAULT (consistent with iac-scan/code-scan).",
+      "high",
+    )
+    .option(
       "--fail-on-secret",
-      "Exit 1 if any secret is found (PR/CI gate). Combine with --min-severity.",
+      "Back-compat: gate on ANY reported secret regardless of severity (equivalent to --fail-on <min-severity>).",
       false,
     )
     .option(
       "--min-severity <severity>",
-      "Only report (and gate on) findings ≥ this severity (low|medium|high|critical)",
+      "Only report findings ≥ this severity (low|medium|high|critical)",
       "low",
     )
     .option("--max-bytes <n>", "Max bytes per file before skipping (default 1MB)", "1048576")
@@ -175,6 +216,7 @@ export function registerSecretScan(program: Command): void {
         opts: {
           json: boolean;
           sarif?: string;
+          failOn: string;
           failOnSecret: boolean;
           minSeverity: string;
           maxBytes: string;
@@ -188,8 +230,10 @@ export function registerSecretScan(program: Command): void {
           installPreCommitHook();
           return;
         }
-        const minSeverity = opts.minSeverity.toLowerCase() as Severity;
-        if (!(minSeverity in SEVERITY_RANK)) {
+        // Allow-list, never `in` — see lib/gate-threshold.ts.
+        const parsedMin = parseSeverityGate(opts.minSeverity);
+        const minSeverity = (parsedMin ?? "") as Severity;
+        if (parsedMin === null) {
           console.error(
             chalk.red(`Invalid --min-severity '${opts.minSeverity}'. Use low|medium|high|critical.`),
           );
@@ -257,10 +301,31 @@ export function registerSecretScan(program: Command): void {
           ignorePathSubstrings: opts.ignorePath,
         });
 
-        const threshold = SEVERITY_RANK[minSeverity];
+        // Map lookup — cannot resolve to a prototype member. `?? 0` gates
+        // everything if a threshold ever reaches here unvalidated.
+        const threshold = severityRank(minSeverity) ?? 0;
         const reported = result.findings.filter(
-          (f) => SEVERITY_RANK[f.severity] >= threshold,
+          (f) => (severityRank(f.severity) ?? 0) >= threshold,
         );
+
+        // Gate: exit 1 when a reported finding meets the fail-on threshold. Gating
+        // is ON by default at "high" (parity with iac-scan / code-scan) so a bare
+        // `secret-scan` in CI actually blocks on committed secrets — the previous
+        // default silently exited 0. `--fail-on-secret` (back-compat) gates on ANY
+        // reported secret; `--fail-on none` disables gating (report-only).
+        // `--fail-on constructor` passed the old `in` check, made the gate
+        // rank a function, and exited 0 over committed credentials.
+        const parsedFailOn = parseSeverityGate(opts.failOn ?? "high", { allowNone: true });
+        if (parsedFailOn === null) {
+          console.error(
+            chalk.red(`Invalid --fail-on '${opts.failOn}'. Use low|medium|high|critical|none.`),
+          );
+          process.exit(2);
+          return;
+        }
+        const failOn = parsedFailOn;
+        const gate = resolveSecretScanGate(reported, minSeverity, failOn, opts.failOnSecret);
+        const shouldFail = gate.shouldFail;
 
         // SARIF file output.
         if (opts.sarif) {
@@ -277,8 +342,7 @@ export function registerSecretScan(program: Command): void {
           console.log(
             `  ${chalk.green("✓")} Wrote ${reported.length} secret finding(s) to ${chalk.cyan(opts.sarif)}`,
           );
-          if (opts.failOnSecret && reported.length > 0) process.exit(1);
-          process.exit(0);
+          process.exit(shouldFail ? 1 : 0);
         }
 
         if (opts.json) {
@@ -295,8 +359,7 @@ export function registerSecretScan(program: Command): void {
               2,
             ) + "\n",
           );
-          if (opts.failOnSecret && reported.length > 0) process.exit(1);
-          process.exit(0);
+          process.exit(shouldFail ? 1 : 0);
         }
 
         // Human-readable.
@@ -337,9 +400,11 @@ export function registerSecretScan(program: Command): void {
           console.log();
         }
 
-        if (opts.failOnSecret) {
+        if (shouldFail) {
           console.log(
-            chalk.red(`  ✗ ${reported.length} secret(s) found at or above '${minSeverity}' — gate failed.`),
+            chalk.red(
+              `  ✗ ${gate.gatedCount} secret(s) at or above '${gate.gateLabel}' — gate failed (exit 1). Pass --fail-on none for report-only.`,
+            ),
           );
           console.log();
           process.exit(1);

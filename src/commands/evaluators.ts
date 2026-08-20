@@ -10,6 +10,14 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { failExit } from "../lib/poll.js";
+import {
+  boundedFetch,
+  decodeJsonBody,
+  expectArray,
+  unwrapApiEnvelope,
+} from "../lib/http.js";
 
 export interface EvaluatorsApiOpts {
   baseUrl: string;
@@ -20,7 +28,7 @@ export interface EvaluatorsApiOpts {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 async function call(path: string, init: RequestInit, opts: EvaluatorsApiOpts): Promise<unknown> {
-  const f = opts.fetchImpl ?? fetch;
+  const f = opts.fetchImpl ?? boundedFetch;
   const res = await f(`${opts.baseUrl}${path}`, {
     ...init,
     headers: {
@@ -29,7 +37,7 @@ async function call(path: string, init: RequestInit, opts: EvaluatorsApiOpts): P
       ...(init.headers ?? {}),
     },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } } | null)?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
@@ -66,12 +74,12 @@ export async function diffEvaluators(
 }
 
 function envConfig(): EvaluatorsApiOpts {
-  const apiKey = process.env.EVALGUARD_API_KEY;
+  const apiKey = resolveApiKey();
   if (!apiKey) {
     console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`."));
     process.exit(1);
   }
-  return { baseUrl: process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1", apiKey };
+  return { baseUrl: resolveBaseUrl(), apiKey };
 }
 
 export function registerEvaluators(program: Command): void {
@@ -87,12 +95,17 @@ export function registerEvaluators(program: Command): void {
     .option("--json", "Output as JSON", false)
     .action(async (opts: { project: string; name?: string; json?: boolean }) => {
       try {
-        const body = (await listEvaluators({
+        const body = await listEvaluators({
           projectId: opts.project,
           name: opts.name,
           ...envConfig(),
-        })) as { data?: Array<Record<string, unknown>> };
-        const rows = body.data ?? [];
+        });
+        // `body.data ?? []` printed "No evaluators found." and exited 0 for a
+        // 200 carrying an unrelated object — measured 2026-08-08.
+        const rows = expectArray(
+          unwrapApiEnvelope(body, "GET /evaluators"),
+          "GET /evaluators",
+        ) as Array<Record<string, unknown>>;
         if (opts.json) {
           console.log(JSON.stringify(rows, null, 2));
           return;
@@ -110,8 +123,8 @@ export function registerEvaluators(program: Command): void {
         }
         console.log();
       } catch (e) {
-        console.error(chalk.red(`evaluators list failed: ${e instanceof Error ? e.message : String(e)}`));
-        process.exit(1);
+        failExit(chalk.red(`evaluators list failed: ${e instanceof Error ? e.message : String(e)}`));
+        return;
       }
     });
 

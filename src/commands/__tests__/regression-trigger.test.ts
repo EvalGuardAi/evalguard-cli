@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { jsonResponse } from "../../__tests__/helpers/response-double.js";
 import {
   fireRegressionTrigger,
   getRegressionConfig,
@@ -15,7 +16,10 @@ function fakeFetch(cap: Captured, body: unknown, ok = true): typeof fetch {
   return (async (url: string, init: RequestInit) => {
     cap.url = url;
     cap.init = init;
-    return { ok, status: ok ? 200 : 400, json: async () => body } as Response;
+    // A REAL Response — see the note in guardrail-shadow.test.ts. The CLI's
+    // shared fail-closed decode reads `res.text()`, which a `.json()`-only
+    // double does not have.
+    return jsonResponse(body, ok ? 200 : 400);
   }) as unknown as typeof fetch;
 }
 

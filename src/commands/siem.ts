@@ -8,6 +8,7 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody } from "../lib/http.js";
 
 function baseUrl(): string { return resolveBaseUrl(); }
 function apiKey(): string {
@@ -16,11 +17,11 @@ function apiKey(): string {
   return k;
 }
 async function apiFetch(path: string, init: RequestInit = {}): Promise<unknown> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${apiKey()}`, "content-type": "application/json", ...(init.headers ?? {}) },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } })?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);

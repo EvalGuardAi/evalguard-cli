@@ -10,12 +10,56 @@ import { Command } from "commander";
 // Module Import Tests
 // ---------------------------------------------------------------------------
 
+/* ─── IMPORT-PHASE WARM-UP: WHY THIS LINE EXISTS ──────────────────────────
+ *
+ * `await import()` inside a test body or hook is billed against `testTimeout`.
+ * Every command module in this package reaches `@evalguard/core` LAZILY — the
+ * barrel re-exports 3,594 symbols over a 2,173-file closure — so the FIRST case
+ * in a file to touch it pays for transforming and evaluating that entire graph
+ * on top of its own work, and every case after it reads a warm registry.
+ *
+ * The signature is unmistakable, measured 2026-08-13 on an idle box:
+ *
+ *     should import the commands module                        8082 ms
+ *     should import registerEvalLocal                             0 ms
+ *     should import registerScanLocal                             0 ms      …
+ *
+ * One case carries the whole file's cost. That fits inside a budget on an idle
+ * box and does not fit under the pre-push sweep, which is why these files are
+ * green 1940/1940 in isolation and red only under the sweep. Reproduced under
+ * the 14-way CPU oversubscription `06e38379c` uses to stand in for it:
+ *
+ *     should import the commands module      30010 ms  ->  Test timed out in 30000ms
+ *     should import registerEvalLocal        19067 ms  ->  passed, but inherited the stall
+ *
+ * — the second line being the cascade `055821495` documents: a timed-out test
+ * does NOT cancel its in-flight dynamic import, so the next case on that module
+ * observes a half-initialised one.
+ *
+ * The fix is to move the load into this file's IMPORT phase, which vitest bills
+ * against no per-test budget. It must be a top-level `await import`, NOT a
+ * static import: vitest hoists `vi.mock` above static imports, so a static one
+ * would load the graph BEFORE this file's mocks are registered — a different
+ * module than the cases are written against.
+ *
+ * The cases below are deliberately left alone. Several of them have `await
+ * import()` as their actual SUBJECT ("should import the commands module"), so
+ * rewriting them to read a hoisted binding would delete what they check. After
+ * this line their `await import()` is a warm-registry lookup, which is the
+ * point — the cost moved, the assertions did not.
+ *
+ * Sibling files in this package carry the short form of this note and point
+ * back here.
+ */
+await import("@evalguard/core");
+await import("../commands");
+
 describe("CLI Smoke Tests -- Module Imports", () => {
   it("should import the commands module", async () => {
     const mod = await import("../commands");
     expect(mod).toBeDefined();
     expect(typeof mod.registerList).toBe("function");
-  }, 30_000);
+  });
 
   it("should import registerEvalLocal", async () => {
     const mod = await import("../commands");
@@ -61,7 +105,7 @@ describe("CLI Core Dependencies", () => {
   it("should import @evalguard/core", async () => {
     const core = await import("@evalguard/core");
     expect(core).toBeDefined();
-  }, 30_000);
+  });
 
   it("should access ALL_PLUGINS from core (canonical FEATURE_COUNTS floor)", async () => {
     const { ALL_PLUGINS, FEATURE_COUNTS } = await import("@evalguard/core");

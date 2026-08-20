@@ -16,13 +16,22 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { failExit } from "../lib/poll.js";
+import {
+  boundedFetch,
+  decodeJsonBody,
+  expectArrayField,
+  expectField,
+  unwrapApiEnvelope,
+} from "../lib/http.js";
 
 function baseUrl(): string {
-  return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  return resolveBaseUrl();
 }
 
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) {
     console.error(chalk.red("EVALGUARD_API_KEY is not set. Run `evalguard login --key <key>` first."));
     process.exit(1);
@@ -72,15 +81,34 @@ interface RunResult {
 }
 
 async function apiFetch<T>(path: string, method: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     method,
     headers: { "content-type": "application/json", authorization: `Bearer ${apiKey()}` },
     body: body ? JSON.stringify(body) : undefined,
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`request failed (${res.status}): ${text.slice(0, 300)}`);
-  const json = text ? JSON.parse(text) : {};
-  return (json.data ?? json) as T;
+  // FAIL CLOSED. This used to hand-roll its own decode:
+  //
+  //     const text = await res.text();
+  //     const json = text ? JSON.parse(text) : {};
+  //     return (json.data ?? json) as T;
+  //
+  // which is the fail-open with the serial numbers filed off — an EMPTY body
+  // (and a 204) became `{}`, and `{}` then read as "no SBOM monitor configured".
+  // Measured 2026-08-08: `evalguard sbom-monitor status` exited 0 with
+  // "No SBOM monitor configured for this project." against a 204, an empty
+  // body, `{"hello":"world"}`, `{success:true,data:null}`, a `success:false`
+  // envelope AND a bare `"ok"` — six of the twelve cases in the matrix, the
+  // worst row in the CLI.
+  //
+  // It also slipped past `__tests__/http-boundary-gate.test.ts`, which banned
+  // `fetch(` and `.json().catch(` but not a hand-written `res.text()` +
+  // `JSON.parse`. The gate now scans for this shape too.
+  if (!res.ok) {
+    const body = await decodeJsonBody(res, path);
+    const detail = (body as { error?: { message?: string } } | null)?.error?.message;
+    throw new Error(`request failed (${res.status})${detail ? `: ${detail}` : ""}`);
+  }
+  return unwrapApiEnvelope(await decodeJsonBody(res, path), path) as T;
 }
 
 function fmtCve(c: AlertableCve): string {
@@ -144,10 +172,19 @@ export function registerSbomMonitor(program: Command): void {
     .option("--json", "output raw JSON")
     .action(async (opts: { project: string; json?: boolean }) => {
       try {
-        const result = await apiFetch<{ monitor: MonitorRecord | null; snapshots: SnapshotSummary[] }>(
+        const raw = await apiFetch<unknown>(
           `/sbom-monitor?projectId=${encodeURIComponent(opts.project)}`,
           "GET",
         );
+        // The route always sends BOTH keys; `monitor` may legitimately be null
+        // ("not configured"), `snapshots` may legitimately be empty. What must
+        // not pass is a body carrying neither — `!result.monitor` on an
+        // unrelated 200 printed "No SBOM monitor configured" and exited 0.
+        const endpoint = "GET /sbom-monitor";
+        const result = {
+          monitor: expectField(raw, "monitor", endpoint) as MonitorRecord | null,
+          snapshots: expectArrayField(raw, "snapshots", endpoint) as SnapshotSummary[],
+        };
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
           return;
@@ -174,8 +211,8 @@ export function registerSbomMonitor(program: Command): void {
           );
         }
       } catch (err) {
-        console.error(chalk.red("✗ ") + (err as Error).message);
-        process.exit(1);
+        failExit(chalk.red("✗ ") + (err as Error).message);
+        return;
       }
     });
 

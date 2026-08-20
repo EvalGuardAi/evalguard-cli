@@ -215,22 +215,26 @@ export function convertHumanloopExport(
     }
   }
 
-  // ── Evaluators → defaultScorers ──
+  // ── Evaluators → defaultScorers ── only truly-mapped evaluators become
+  // scorers and count toward `evaluatorCount`. Unknown evaluators
+  // (code/custom/api/…) are surfaced in `unmappedEvaluators` with a suggestion
+  // instead of being written as a bogus `scorer:` name (which would later trip
+  // "Unknown scorers") and instead of inflating the mapped count.
   const rawEvaluators = (project.evaluators ?? []) as Record<string, unknown>[];
   const defaultScorers: EvalGuardScorer[] = [];
   const unmappedSet = new Set<string>();
   for (const e of rawEvaluators) {
-    const mapped = mapHumanloopEvaluator(e);
-    if (!mapped) continue;
-    defaultScorers.push(mapped);
-    // Track the original key for the unmapped report.
     const key =
       (e.type as string) ??
       (e.metric as string) ??
       (e.name as string);
-    if (key) {
-      const lower = key.toLowerCase();
-      if (!EVALUATOR_TYPE_MAP[lower]) unmappedSet.add(lower);
+    if (!key) continue;
+    const lower = key.toLowerCase();
+    if (EVALUATOR_TYPE_MAP[lower]) {
+      const mapped = mapHumanloopEvaluator(e);
+      if (mapped) defaultScorers.push(mapped);
+    } else {
+      unmappedSet.add(lower);
     }
   }
 
@@ -254,22 +258,48 @@ export function convertHumanloopExport(
 
 // ─── YAML / JSON loader (shared pattern with import-promptfoo) ───────
 
-async function loadHumanloopFile(filePath: string): Promise<Record<string, unknown>> {
+type YamlParse = (s: string) => unknown;
+
+/**
+ * Load a Humanloop export from disk as JSON (the default) or YAML.
+ *
+ * As with the promptfoo loader, the failure modes are DISTINCT: a genuinely
+ * missing `yaml` module is reported as unavailable, but when `yaml` IS present
+ * and the file is malformed the real parser error (line/column) is surfaced —
+ * not swallowed into an opaque "could not parse as JSON or YAML".
+ *
+ * Exported so the loader's error contract can be unit-tested directly.
+ */
+export async function loadHumanloopFile(filePath: string): Promise<Record<string, unknown>> {
   const content = fs.readFileSync(filePath, "utf-8");
   try {
-    return JSON.parse(content);
+    return JSON.parse(content) as Record<string, unknown>;
   } catch {
-    try {
-      const yamlMod = await import("yaml");
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const parse = (yamlMod as any).parse ?? (yamlMod as any).default?.parse;
-      if (parse) return parse(content) as Record<string, unknown>;
-    } catch {
-      // fall through
-    }
+    // Not JSON — Humanloop exports are JSON by default, but accept YAML too.
+  }
+
+  const jsonHint =
+    "Humanloop exports are JSON by default — try 'humanloop export project --format=json'.";
+  let parse: YamlParse | undefined;
+  try {
+    const yamlMod = await import("yaml");
+    parse =
+      (yamlMod as { parse?: YamlParse }).parse ??
+      (yamlMod as { default?: { parse?: YamlParse } }).default?.parse;
+  } catch {
+    throw new Error(`Could not parse file as JSON, and the 'yaml' package is unavailable. ${jsonHint}`);
+  }
+  if (typeof parse !== "function") {
+    throw new Error(`Could not parse file as JSON, and the 'yaml' package is unavailable. ${jsonHint}`);
+  }
+
+  // `yaml` IS present — a throw here means a genuinely malformed file. Surface
+  // the real parser error instead of the generic "could not parse" message.
+  try {
+    return parse(content) as Record<string, unknown>;
+  } catch (err) {
     throw new Error(
-      "Could not parse file as JSON or YAML. Humanloop exports are JSON by default — try " +
-        "'humanloop export project --format=json'.",
+      `Invalid Humanloop export (not valid JSON or YAML): ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 }
@@ -363,8 +393,13 @@ export function registerImportHumanloop(program: Command): void {
         console.log();
         console.log(chalk.bold("  Next steps:"));
         console.log(`    1. Review ${chalk.cyan(opts.output)} — manually re-create any 'code' evaluators`);
-        console.log(`    2. Run: ${chalk.cyan("npx evalguard eval " + opts.output)}`);
-        console.log(`    3. Try: ${chalk.cyan("npx evalguard scan")} for 249+ red team attacks`);
+        // `eval:local` is the keyless local runner and reads the converted
+        // providers/prompts/defaultScorers shape directly. Plain `eval` is
+        // server-backed and fails keyless with "Could not resolve a default
+        // project", so point the cloud path at `eval --project <id>`.
+        console.log(`    2. Run locally (no API key): ${chalk.cyan("npx @evalguard/cli eval:local " + opts.output)}`);
+        console.log(`       Or run in the cloud:     ${chalk.cyan("npx @evalguard/cli eval --project <id> " + opts.output)}`);
+        console.log(`    3. Try: ${chalk.cyan("npx @evalguard/cli scan")} for 300+ red team attacks`);
         console.log();
         console.log(chalk.dim("  Full migration guide: https://evalguard.ai/migrate-from-humanloop"));
         console.log();

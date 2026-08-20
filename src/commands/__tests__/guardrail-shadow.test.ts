@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { jsonResponse } from "../../__tests__/helpers/response-double.js";
 import {
   createShadowConfig,
   listShadowConfigs,
@@ -16,7 +17,14 @@ function fakeFetch(cap: Captured, body: unknown, ok = true): typeof fetch {
   return (async (url: string, init: RequestInit) => {
     cap.url = url;
     cap.init = init;
-    return { ok, status: ok ? 200 : 400, json: async () => body } as Response;
+    // A REAL Response, not `{ok,status,json} as Response`. That cast asserted a
+    // shape the double did not have: the CLI's shared decode boundary
+    // (lib/http.ts) reads `res.text()` so it can tell an EMPTY body and a
+    // non-JSON body apart from a parsed one — a distinction `.json()` alone
+    // cannot make, and the whole point of the fail-closed decode. A double that
+    // implements only half of `Response` tests a code path the shipped CLI never
+    // takes.
+    return jsonResponse(body, ok ? 200 : 400);
   }) as unknown as typeof fetch;
 }
 

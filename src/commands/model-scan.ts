@@ -242,9 +242,18 @@ export function registerModelScan(program: Command): void {
       }
 
       // JSON output
+      //
+      // CI-GATE (deep-E2E audit 2026-07-25, M9): this branch used to `return`
+      // with no exit code, so `evalguard model-scan ./models --format json`
+      // exited 0 on a pickle containing `os.system` / REDUCE / STACK_GLOBAL —
+      // the machine-readable mode a pipeline actually uses was the one that
+      // failed open, while only the human-readable text path gated. The JSON
+      // body already reported `hasCritical: true`; the process just did not.
       if (opts.format === "json") {
         const jsonOutput: Record<string, unknown>[] = [];
+        let jsonCritical = 0;
         for (const [file, findings] of allResults) {
+          jsonCritical += findings.filter((f) => f.severity === "critical").length;
           jsonOutput.push({
             file,
             findings: findings.map((f) => ({ ...f })),
@@ -253,6 +262,8 @@ export function registerModelScan(program: Command): void {
           });
         }
         console.log(JSON.stringify(jsonOutput, null, 2));
+        // Same threshold as the text path below.
+        if (jsonCritical > 0) process.exit(1);
         return;
       }
 

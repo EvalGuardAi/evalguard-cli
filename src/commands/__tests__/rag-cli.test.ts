@@ -4,10 +4,16 @@ import { Command } from "commander";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { jsonResponse } from "../../__tests__/helpers/response-double.js";
 import { registerRag } from "../rag.js";
 
-function jsonResponse(data: unknown) {
-  return { ok: true, status: 200, json: async () => ({ data }) };
+// Real Response — see the note in data-quality-redteam-cli.test.ts.
+function envelope(data: unknown): Response {
+  // `success: true` matters: every /api/v1 route answers through apiSuccess()
+  // (apps/web/src/lib/api.ts:8), which ALWAYS emits it. A bare `{ data }` is a
+  // shape no route sends, and asserting against it meant this double could not
+  // exercise the envelope contract the CLI now enforces (audit 2026-08-09).
+  return jsonResponse({ success: true, data });
 }
 
 describe("CLI — rag ingest (E2E, fetch mocked)", () => {
@@ -26,7 +32,7 @@ describe("CLI — rag ingest (E2E, fetch mocked)", () => {
   });
 
   it("reads a documents JSON file and POSTs it to /rag/ingest", async () => {
-    const f = vi.fn(async () => jsonResponse({ chunkCount: 3, embedded: false, chunks: [] }));
+    const f = vi.fn(async () => envelope({ chunkCount: 3, embedded: false, chunks: [] }));
     globalThis.fetch = f as unknown as typeof fetch;
 
     const tmp = path.join(os.tmpdir(), `eg-rag-${process.pid}.json`);

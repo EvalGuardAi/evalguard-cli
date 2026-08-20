@@ -8,12 +8,14 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody, expectResult } from "../lib/http.js";
 
 function baseUrl(): string {
-  return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  return resolveBaseUrl();
 }
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) {
     console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`."));
     process.exit(1);
@@ -21,7 +23,7 @@ function apiKey(): string {
   return k;
 }
 async function apiFetch(path: string, init: RequestInit = {}): Promise<unknown> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${apiKey()}`,
@@ -29,7 +31,7 @@ async function apiFetch(path: string, init: RequestInit = {}): Promise<unknown> 
       ...(init.headers ?? {}),
     },
   });
-  const body = (await res.json().catch(() => null)) as { data?: unknown; error?: { message?: string } } | null;
+  const body = (await decodeJsonBody(res, `${path}`)) as { data?: unknown; error?: { message?: string } } | null;
   if (!res.ok) throw new Error(body?.error?.message ?? `HTTP ${res.status}`);
   return body;
 }
@@ -51,14 +53,18 @@ export function registerRag(program: Command): void {
         console.error(chalk.red(`Failed to read/parse ${opts.file}: ${e instanceof Error ? e.message : String(e)}`));
         process.exit(1);
       }
-      const body = (await apiFetch("/rag/ingest", { method: "POST", body: JSON.stringify(payload) })) as {
-        data: { chunkCount: number; embedded: boolean; model?: string; chunks: unknown[] };
-      };
+      // `RAG ingest — undefined chunks · not embedded`, exit 0, was the measured
+      // output for a 200 carrying `{"success":true,"data":{}}`: the ingest may
+      // never have happened and the CLI reported a completed one.
+      const d = expectResult<{ chunkCount: number; embedded: boolean; model?: string; chunks?: unknown[] }>(
+        await apiFetch("/rag/ingest", { method: "POST", body: JSON.stringify(payload) }),
+        "POST /rag/ingest",
+        ["chunkCount", "embedded"],
+      );
       if (opts.json) {
-        console.log(JSON.stringify(body.data, null, 2));
+        console.log(JSON.stringify(d, null, 2));
         return;
       }
-      const d = body.data;
       const embedNote = d.embedded ? chalk.green(` · embedded (${d.model})`) : chalk.dim(" · not embedded");
       console.log(chalk.bold(`RAG ingest — ${d.chunkCount} chunk${d.chunkCount === 1 ? "" : "s"}`) + embedNote);
     });

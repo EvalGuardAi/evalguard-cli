@@ -4,8 +4,35 @@ import type { SbomScanResult } from "../ai-bom.js";
 
 const PROJECT = "00000000-0000-4000-8000-000000000001";
 
+// The AI-BOM route emits THREE DOCUMENTS, one per standard — it used to emit
+// one shape and vary `bomFormat` on it, which was conformant to neither
+// (`45f06d350`, apps/web/src/app/api/v1/ai-sbom/_formats.ts). SPDX 2.3's root
+// is `additionalProperties: false`, so an SPDX document cannot carry
+// `bomFormat`/`specVersion`/`components` at all; these fixtures are the shapes
+// `buildCycloneDx16` / `buildSpdx23` / `buildNativeAiBom` actually produce.
+const CDX_DOC = JSON.stringify({
+  bomFormat: "CycloneDX",
+  specVersion: "1.6",
+  version: 1,
+  metadata: { timestamp: "2026-08-09T12:00:00.000Z" },
+  components: [{ "bom-ref": "evalguard:model:0", type: "machine-learning-model", name: "llama" }],
+  dependencies: [{ ref: "evalguard:root" }],
+});
+const SPDX_DOC = JSON.stringify({
+  spdxVersion: "SPDX-2.3",
+  dataLicense: "CC0-1.0",
+  SPDXID: "SPDXRef-DOCUMENT",
+  name: "evalguard-ai-bom-00000000",
+  documentNamespace: "https://evalguard.ai/spdx/ai-bom/00000000/1111",
+  creationInfo: { created: "2026-08-09T12:00:00Z", creators: ["Organization: EvalGuard"] },
+  packages: [{ SPDXID: "SPDXRef-Package-Project", name: "project-00000000", filesAnalyzed: false }],
+  relationships: [],
+});
+const DOC_FOR = { cyclonedx: CDX_DOC, spdx: SPDX_DOC } as const;
+
 function mockResponse(body: string, opts: { status?: number; cd?: string; ct?: string } = {}): Response {
-  return new Response(body, {
+  // A 204 carries a NULL body by spec; `new Response("", {status:204})` throws.
+  return new Response(opts.status === 204 ? null : body, {
     status: opts.status ?? 200,
     headers: {
       ...(opts.cd ? { "content-disposition": opts.cd } : {}),
@@ -33,7 +60,7 @@ describe("fetchAiBom", () => {
       expect(url).toContain(PROJECT);
       expect(url).toContain("format=cyclonedx");
       expect((init?.headers as Record<string, string>).authorization).toBe("Bearer test-key");
-      return mockResponse('{"bomFormat":"CycloneDX"}', {
+      return mockResponse(CDX_DOC, {
         cd: 'attachment; filename="ai-bom-from-server.cdx.json"',
       });
     }) as unknown as typeof fetch;
@@ -46,13 +73,19 @@ describe("fetchAiBom", () => {
       fetchImpl,
     });
 
-    expect(out.body).toBe('{"bomFormat":"CycloneDX"}');
+    expect(out.body).toBe(CDX_DOC);
     expect(out.suggestedFilename).toBe("ai-bom-from-server.cdx.json");
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to a sensible filename when server omits Content-Disposition", async () => {
-    const fetchImpl = vi.fn(async () => mockResponse("{}", {})) as unknown as typeof fetch;
+    // The fixture here used to be `"{}"`. That PINNED the defect: it asserted
+    // that an empty object is an acceptable SPDX export — and "accept anything"
+    // is exactly how an nginx 502 page and a 0-byte file reached disk as SBOMs
+    // (audit 2026-08-09). The body is now what the route actually emits for
+    // `--format spdx`: one document shape carrying the SPDX marker
+    // (apps/web/src/app/api/v1/ai-sbom/route.ts:69).
+    const fetchImpl = vi.fn(async () => mockResponse(SPDX_DOC, {})) as unknown as typeof fetch;
     const out = await fetchAiBom({
       projectId: PROJECT,
       format: "spdx",
@@ -61,6 +94,111 @@ describe("fetchAiBom", () => {
       fetchImpl,
     });
     expect(out.suggestedFilename).toMatch(/^evalguard-ai-bom-00000000\.spdx\.json$/);
+  });
+
+  it("REFUSES every measured fault body instead of writing it as an SBOM", async () => {
+    // The 11 fault modes the pre-fix CLI wrote to disk and reported as
+    // `✓ Wrote N bytes to …`, exit 0. Driven through the real code path, not a
+    // mock of the validator.
+    const faults: Array<[string, string, number?]> = [
+      ["invalid JSON", "this is not JSON at all {{{"],
+      ["an empty body", ""],
+      ["a 204", "", 204],
+      ["a JSON null", "null"],
+      ["a bare string", '"ok"'],
+      ["an unrelated object", '{"hello":"world"}'],
+      ["a success envelope with data:null", '{"success":true,"data":null}'],
+      ["an empty success envelope", '{"success":true,"data":{}}'],
+      ["a 200 carrying an error envelope", '{"success":false,"error":{"message":"boom"}}'],
+      ["an nginx 502 page", "<html>\n<head><title>502 Bad Gateway</title></head>\n</html>"],
+      ["2 MB of filler", "x".repeat(2 * 1024 * 1024)],
+    ];
+    for (const [what, body, status] of faults) {
+      const fetchImpl = vi.fn(async () =>
+        mockResponse(body, { status: status ?? 200 }),
+      ) as unknown as typeof fetch;
+      await expect(
+        fetchAiBom({
+          projectId: PROJECT,
+          format: "cyclonedx",
+          baseUrl: "https://x.test/api/v1",
+          apiKey: "k",
+          fetchImpl,
+        }),
+        `${what} must never become an SBOM`,
+      ).rejects.toThrow(/was NOT written/);
+    }
+  });
+
+  it.each(["cyclonedx", "spdx"] as const)("accepts a real --format %s document (control)", async (format) => {
+    const doc = DOC_FOR[format];
+    const fetchImpl = vi.fn(async () => mockResponse(doc, {})) as unknown as typeof fetch;
+    const out = await fetchAiBom({
+      projectId: PROJECT,
+      format,
+      baseUrl: "https://x.test/api/v1",
+      apiKey: "k",
+      fetchImpl,
+    });
+    expect(out.body).toBe(doc);
+  });
+
+  it("accepts --format json inside the apiSuccess envelope the route uses (control)", async () => {
+    // The route returns a BARE document for cyclonedx/spdx and `apiSuccess(sbom)`
+    // for json (route.ts:117-130). Refusing the envelope for json would reject
+    // the server's own output.
+    const enveloped = JSON.stringify({
+      success: true,
+      data: { bomFormat: "EvalGuard-AIBOM", specVersion: "1.0.0", components: { models: [] } },
+    });
+    const fetchImpl = vi.fn(async () => mockResponse(enveloped, {})) as unknown as typeof fetch;
+    const out = await fetchAiBom({
+      projectId: PROJECT,
+      format: "json",
+      baseUrl: "https://x.test/api/v1",
+      apiKey: "k",
+      fetchImpl,
+    });
+    expect(out.body).toBe(enveloped);
+  });
+
+  it("refuses a CycloneDX document when SPDX was requested", async () => {
+    // The two standards no longer share a field, so a CycloneDX export offered
+    // as SPDX fails on SPDX's own marker rather than on a mismatched value —
+    // but the outcome that matters is unchanged: it is not filed as an SPDX
+    // artifact. Asserted on the SPECIFIC reason, not just "some refusal", so a
+    // future loosening cannot pass this row by refusing for an unrelated cause.
+    const fetchImpl = vi.fn(async () => mockResponse(CDX_DOC, {})) as unknown as typeof fetch;
+    await expect(
+      fetchAiBom({
+        projectId: PROJECT,
+        format: "spdx",
+        baseUrl: "https://x.test/api/v1",
+        apiKey: "k",
+        fetchImpl,
+      }),
+    ).rejects.toThrow(/declares no `spdxVersion`.*`--format spdx` asked for/);
+    // ...and the reverse: an SPDX-shaped document is refused for cyclonedx.
+    const back = vi.fn(async () => mockResponse(SPDX_DOC, {})) as unknown as typeof fetch;
+    await expect(
+      fetchAiBom({ projectId: PROJECT, format: "cyclonedx", baseUrl: "https://x.test/api/v1", apiKey: "k", fetchImpl: back }),
+    ).rejects.toThrow(/declares no `bomFormat`/);
+  });
+
+  it("refuses a document claiming the WRONG SPDX version — value, not mere presence", async () => {
+    // The marker rule is a VALUE check. An SPDX 2.2 document is structurally
+    // an SPDX document, so only the value distinguishes it, and archiving it
+    // as the 2.3 export we advertise would misstate what the auditor holds.
+    const doc = JSON.stringify({ ...(JSON.parse(SPDX_DOC) as object), spdxVersion: "SPDX-2.2" });
+    const fetchImpl = vi.fn(async () => mockResponse(doc, {})) as unknown as typeof fetch;
+    await expect(
+      fetchAiBom({ projectId: PROJECT, format: "spdx", baseUrl: "https://x.test/api/v1", apiKey: "k", fetchImpl }),
+    ).rejects.toThrow(/"SPDX-2.2" but "SPDX-2.3" was requested/);
+    // control: the same document with the right version is accepted.
+    const ok = vi.fn(async () => mockResponse(SPDX_DOC, {})) as unknown as typeof fetch;
+    await expect(
+      fetchAiBom({ projectId: PROJECT, format: "spdx", baseUrl: "https://x.test/api/v1", apiKey: "k", fetchImpl: ok }),
+    ).resolves.toBeTruthy();
   });
 
   it("surfaces structured error body when server returns 4xx", async () => {

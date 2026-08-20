@@ -10,12 +10,16 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { parseGateThreshold } from "../lib/gate-threshold.js";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { failExit } from "../lib/poll.js";
+import { boundedFetch, decodeJsonBody, expectBooleanField, expectResult } from "../lib/http.js";
 
 function baseUrl(): string {
-  return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  return resolveBaseUrl();
 }
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) {
     console.error(chalk.red("EVALGUARD_API_KEY is not set. Run `evalguard login --key <key>` first."));
     process.exit(1);
@@ -41,16 +45,35 @@ export async function fetchScorecardCli(opts: {
   fetchImpl?: typeof fetch;
 }): Promise<ScorecardCliResult> {
   if (!opts.repo) throw new Error("repo is required");
-  const fetchFn = opts.fetchImpl ?? fetch;
+  const fetchFn = opts.fetchImpl ?? boundedFetch;
   const res = await fetchFn(`${opts.baseUrl}/supply-chain/scorecard`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${opts.apiKey}` },
     body: JSON.stringify({ repo: opts.repo }),
   });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`scorecard failed (${res.status}): ${text.slice(0, 300)}`);
-  const json = JSON.parse(text);
-  return (json.data ?? json) as ScorecardCliResult;
+  // FAIL CLOSED via the shared boundary. This used to hand-roll
+  // `res.text()` + `JSON.parse` + `json.data ?? json`, which passes an unrelated
+  // 200 straight through to the renderer and treats a `success:false` envelope
+  // as a result. See lib/http.ts, and the sbom-monitor note for the measured
+  // case where the same shape rendered an empty body as "nothing configured".
+  const decoded = await decodeJsonBody(res, "POST /supply-chain/scorecard");
+  if (!res.ok) {
+    const detail = (decoded as { error?: { message?: string } } | null)?.error?.message;
+    throw new Error(`scorecard failed (${res.status})${detail ? `: ${detail}` : ""}`);
+  }
+  // `unwrapApiEnvelope` alone still let an unrelated 200 through: measured,
+  // `{"hello":"world"}` and `{"success":true,"data":{}}` both printed
+  //     • undefined — no scorecard available (unknown)
+  // and exited 0, because `available` was `undefined` and every renderer here
+  // spells falsy as the "nothing to see" branch. `repo` + a BOOLEAN `available`
+  // are the two fields that make this body this route's answer.
+  const result = expectResult<ScorecardCliResult>(
+    decoded,
+    "POST /supply-chain/scorecard",
+    ["repo"],
+  );
+  expectBooleanField(result, "available", "POST /supply-chain/scorecard");
+  return result;
 }
 
 export function registerScorecard(program: Command): void {
@@ -64,8 +87,12 @@ export function registerScorecard(program: Command): void {
       try {
         result = await fetchScorecardCli({ repo, baseUrl: baseUrl(), apiKey: apiKey() });
       } catch (err) {
-        console.error(chalk.red("✗ ") + (err as Error).message);
-        process.exit(1);
+        // process.exitCode, not process.exit(): the just-failed request's
+        // undici sockets are still tearing down, and exiting mid-teardown
+        // trips a libuv `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)`
+        // abort that replaces the intended exit 1 with 127 on Windows.
+        // Same guard as reportFatal() in src/index.ts.
+        failExit(chalk.red("✗ ") + (err as Error).message);
         return;
       }
 
@@ -82,8 +109,24 @@ export function registerScorecard(program: Command): void {
         }
       }
 
-      if (options.failBelow && result.available && (result.score ?? 0) < Number(options.failBelow)) {
-        process.exit(1);
+      if (options.failBelow !== undefined) {
+        const min = parseGateThreshold(options.failBelow, "--fail-below", { min: 0, max: 10 });
+        // Fail CLOSED when there is no scorecard at all: `--fail-below` asks
+        // "prove this repo meets the bar", and an unavailable scorecard is not
+        // proof (audit L15). Previously `result.available &&` made a repo with
+        // no scorecard pass the gate silently.
+        if (!result.available) {
+          console.error(
+            chalk.red(`No OpenSSF Scorecard available for ${result.repo} — cannot satisfy --fail-below ${min}.`),
+          );
+          // `return` is load-bearing: process.exit() halted here, whereas
+          // setting exitCode alone would fall through to the score check below.
+          process.exitCode = 1;
+          return;
+        }
+        if ((result.score ?? 0) < min) {
+          process.exitCode = 1;
+        }
       }
     });
 }

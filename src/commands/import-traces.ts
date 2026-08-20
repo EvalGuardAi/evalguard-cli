@@ -73,7 +73,7 @@ export function registerImportTraces(program: Command): void {
     .description("Import traces from Helicone / Langfuse / Portkey exports")
     .argument("<file>", "Path to the export file (JSON or JSONL)")
     .requiredOption("--from <platform>", `Source platform (${SUPPORTED_PLATFORMS.join(" | ")})`)
-    .option("--output <path>", "Write the imported neutral-shape spans to this JSON file")
+    .option("-o, --output <path>", "Write the imported neutral-shape spans to this JSON file")
     .option("--show-errors", "Print full error list (default: count only)", false)
     .option("--limit <n>", "Process only the first N records (smoke testing)", (v) => parseInt(v, 10))
     .action((file: string, opts: { from: string; output?: string; showErrors?: boolean; limit?: number }) => {

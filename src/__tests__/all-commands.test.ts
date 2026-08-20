@@ -49,6 +49,7 @@ import {
   formatCSV,
   formatHTML,
 } from "@evalguard/core";
+import { FEATURE_COUNTS } from "@evalguard/core/counts";
 
 import type { FirewallRule, EvalOutput, EvalResultRow } from "@evalguard/core";
 
@@ -856,8 +857,8 @@ describe("Command: list strategies", () => {
     expect(sub).toBeDefined();
   });
 
-  it("has exactly 47 strategies", () => {
-    expect(ALL_STRATEGIES.length).toBe(47);
+  it("matches the canonical strategy count (drift gate)", () => {
+    expect(ALL_STRATEGIES.length).toBe(FEATURE_COUNTS.redTeamStrategies);
   });
 
   it("all strategies have unique IDs and transform functions", () => {
@@ -889,8 +890,8 @@ describe("Command: list graders", () => {
     expect(sub).toBeDefined();
   });
 
-  it("has exactly 10 graders", () => {
-    expect(ALL_GRADERS.length).toBe(30);
+  it("has exactly 45 graders", () => {
+    expect(ALL_GRADERS.length).toBe(45);
   });
 
   it("all graders have unique IDs and grade functions", () => {

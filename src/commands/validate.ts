@@ -6,6 +6,102 @@ import chalk from "chalk";
 import * as fs from "fs";
 import * as path from "path";
 import { parse as parseYaml } from "yaml";
+// The canonical Promptfoo-assertion → EvalGuard-scorer alias table. `eval:local`
+// resolves assertion `type`s through this map at runtime (e.g. `llm-rubric` runs
+// as `llm-grader`, `is-json` as `json-valid`), so the validator MUST accept the
+// same aliases — otherwise `init` scaffolds a template whose own `validate`
+// rejects `type: llm-rubric` as an "Unknown scorer" even though it runs fine.
+import { ASSERTION_MAP } from "./import-promptfoo.js";
+
+/** The `@evalguard/core` registries the validator checks names against. */
+export interface ValidateRegistries {
+  BUILT_IN_SCORERS: Record<string, unknown>;
+  ATTACK_TYPES: { type: string }[];
+  ALL_PLUGINS: { id: string }[];
+  ALL_STRATEGIES: { id: string }[];
+  ALL_GRADERS: { id: string }[];
+}
+
+export interface ValidationOutcome {
+  errors: string[];
+  warnings: string[];
+  isEval: boolean;
+  isScan: boolean;
+}
+
+/**
+ * Pure validation of an already-parsed eval/scan config against the core
+ * registries. Mutates `config` in place with the same normalisation the
+ * `validate` command applies (`tests`→`cases` alias, `redteam.*` flattened onto
+ * the top-level fields, derived `scorers` cached for the summary) and returns
+ * the collected errors/warnings + detected type.
+ *
+ * Exported so the `init` templates can be asserted valid without spawning the
+ * CLI (the `.action()` closure does file IO + `process.exit`).
+ */
+export function validateConfigObject(
+  config: Record<string, unknown>,
+  reg: ValidateRegistries,
+): ValidationOutcome {
+  // `evalguard init` and Promptfoo use `tests:` — accept it as alias.
+  if (Array.isArray((config as any).tests) && !Array.isArray((config as any).cases)) {
+    (config as any).cases = (config as any).tests;
+  }
+
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  // Detect config type — accept native (scorers/cases), init/Promptfoo
+  // (tests/prompts), or scan (attackTypes/plugins, or the
+  // `init -t security-scan` template's nested `redteam.plugins`).
+  // A `redteam:` block is authoritative for scan: the security-scan
+  // template also carries a `prompts:` array (the system prompt by file),
+  // which would otherwise be misclassified as an eval and rejected for
+  // missing scorers/cases.
+  const redteam = (config as any).redteam;
+  const hasRedteam = redteam != null && typeof redteam === "object";
+  const isScan = "attackTypes" in config || "plugins" in config || hasRedteam;
+  const isEval = !hasRedteam &&
+    ("scorers" in config || "cases" in config || "tests" in config || "prompts" in config);
+
+  if (!isEval && !isScan) {
+    errors.push("Cannot determine config type. Expected 'scorers'/'cases'/'tests' (eval) or 'attackTypes'/'plugins'/'redteam' (scan).");
+  }
+
+  // The `init -t security-scan` template nests plugins/strategies under
+  // `redteam:`. Flatten them onto the top-level fields the scan validator
+  // (and the summary printout) already understand.
+  if (hasRedteam) {
+    if (!("plugins" in config) && Array.isArray(redteam.plugins)) {
+      (config as any).plugins = redteam.plugins;
+    }
+    if (!("strategies" in config) && Array.isArray(redteam.strategies)) {
+      (config as any).strategies = redteam.strategies;
+    }
+  }
+
+  if (isEval) {
+    validateEvalConfig(config, errors, warnings, reg.BUILT_IN_SCORERS);
+  }
+
+  if (isScan) {
+    validateScanConfig(config, errors, warnings, reg.ATTACK_TYPES, reg.ALL_PLUGINS, reg.ALL_STRATEGIES, reg.ALL_GRADERS);
+  }
+
+  // Common checks
+  if (!config.model && !config.provider) {
+    warnings.push("No 'model' specified. Will need --model flag at runtime.");
+  }
+
+  // Accept either `prompt` (native) or `prompts:` array (init/Promptfoo).
+  if (isEval) {
+    const hasPrompt  = typeof (config as any).prompt === "string";
+    const hasPrompts = Array.isArray((config as any).prompts) && (config as any).prompts.length > 0;
+    if (!hasPrompt && !hasPrompts) errors.push("Missing 'prompt' field (or 'prompts' array).");
+  }
+
+  return { errors, warnings, isEval, isScan };
+}
 
 export function registerValidate(program: Command): void {
   program
@@ -32,62 +128,13 @@ export function registerValidate(program: Command): void {
         console.error(chalk.red(`Invalid ${fmt}: ${err instanceof Error ? err.message : String(err)}`));
         process.exit(1);
       }
-      // `evalguard init` and Promptfoo use `tests:` — accept it as alias.
-      if (Array.isArray((config as any).tests) && !Array.isArray((config as any).cases)) {
-        (config as any).cases = (config as any).tests;
-      }
-
-      const errors: string[] = [];
-      const warnings: string[] = [];
-
-      // Detect config type — accept native (scorers/cases), init/Promptfoo
-      // (tests/prompts), or scan (attackTypes/plugins, or the
-      // `init -t security-scan` template's nested `redteam.plugins`).
-      // A `redteam:` block is authoritative for scan: the security-scan
-      // template also carries a `prompts:` array (the system prompt by file),
-      // which would otherwise be misclassified as an eval and rejected for
-      // missing scorers/cases.
-      const redteam = (config as any).redteam;
-      const hasRedteam = redteam != null && typeof redteam === "object";
-      const isScan = "attackTypes" in config || "plugins" in config || hasRedteam;
-      const isEval = !hasRedteam &&
-        ("scorers" in config || "cases" in config || "tests" in config || "prompts" in config);
-
-      if (!isEval && !isScan) {
-        errors.push("Cannot determine config type. Expected 'scorers'/'cases'/'tests' (eval) or 'attackTypes'/'plugins'/'redteam' (scan).");
-      }
-
-      // The `init -t security-scan` template nests plugins/strategies under
-      // `redteam:`. Flatten them onto the top-level fields the scan validator
-      // (and the summary printout) already understand.
-      if (hasRedteam) {
-        if (!("plugins" in config) && Array.isArray(redteam.plugins)) {
-          (config as any).plugins = redteam.plugins;
-        }
-        if (!("strategies" in config) && Array.isArray(redteam.strategies)) {
-          (config as any).strategies = redteam.strategies;
-        }
-      }
-
-      if (isEval) {
-        validateEvalConfig(config, errors, warnings, BUILT_IN_SCORERS);
-      }
-
-      if (isScan) {
-        validateScanConfig(config, errors, warnings, ATTACK_TYPES, ALL_PLUGINS, ALL_STRATEGIES, ALL_GRADERS);
-      }
-
-      // Common checks
-      if (!config.model && !config.provider) {
-        warnings.push("No 'model' specified. Will need --model flag at runtime.");
-      }
-
-      // Accept either `prompt` (native) or `prompts:` array (init/Promptfoo).
-      if (isEval) {
-        const hasPrompt  = typeof (config as any).prompt === "string";
-        const hasPrompts = Array.isArray((config as any).prompts) && (config as any).prompts.length > 0;
-        if (!hasPrompt && !hasPrompts) errors.push("Missing 'prompt' field (or 'prompts' array).");
-      }
+      const { errors, warnings, isEval, isScan } = validateConfigObject(config, {
+        BUILT_IN_SCORERS,
+        ATTACK_TYPES,
+        ALL_PLUGINS,
+        ALL_STRATEGIES,
+        ALL_GRADERS,
+      });
 
       // Display results
       console.log();
@@ -125,37 +172,72 @@ export function registerValidate(program: Command): void {
 
 function validateEvalConfig(config: Record<string, unknown>, errors: string[], warnings: string[], BUILT_IN_SCORERS: any): void {
   const availableScorers = Object.keys(BUILT_IN_SCORERS);
+  // A scorer name is valid if it's a built-in OR a Promptfoo assertion `type`
+  // the runtime aliases onto one (e.g. `llm-rubric` → `llm-grader`). Resolving
+  // through ASSERTION_MAP first keeps `validate` in lockstep with what
+  // `eval:local` actually runs. Identity entries (`contains` → `contains`) make
+  // this a no-op for already-canonical names.
+  const isKnownScorer = (s: string): boolean =>
+    availableScorers.includes(s) || availableScorers.includes(ASSERTION_MAP[s]);
 
-  // Harvest scorer names from per-case `assert:` blocks (init / Promptfoo
-  // style) so configs without a top-level `scorers:` still validate.
+  // Extract a scorer NAME from a bare string ("contains") OR an object entry:
+  //  - `{type: "llm-rubric"}`  — init / Promptfoo `assert:` shape
+  //  - `{scorer: "contains"}`  — import:promptfoo / import:humanloop output shape
+  //  - `{name: "toxicity"}`    — alternative label
+  const scorerName = (s: unknown): string =>
+    typeof s === "string"
+      ? s
+      : String((s as Record<string, unknown>)?.scorer ??
+               (s as Record<string, unknown>)?.name ??
+               (s as Record<string, unknown>)?.type ?? "");
+
+  // Harvest scorer names from per-case blocks: `assert:` (init / Promptfoo)
+  // AND `scorers:` (the shape `import:promptfoo`/`import:humanloop` write) so a
+  // config that carries its scorers per case still validates.
   const cases = Array.isArray(config.cases) ? (config.cases as Record<string, unknown>[]) : [];
-  const assertScorers = cases
-    .flatMap((c) => (Array.isArray(c?.assert) ? (c.assert as Record<string, unknown>[]) : []))
-    .map((a) => String(a?.scorer ?? a?.name ?? a?.type ?? ""))
+  const perCaseScorers = cases
+    .flatMap((c) => [
+      ...(Array.isArray(c?.assert) ? (c.assert as unknown[]) : []),
+      ...(Array.isArray(c?.scorers) ? (c.scorers as unknown[]) : []),
+    ])
+    .map(scorerName)
     .filter(Boolean);
 
-  // Scorers — top-level OR derived from per-case assertions
-  if (config.scorers) {
-    if (!Array.isArray(config.scorers)) {
-      errors.push("'scorers' must be an array of strings.");
+  // Top-level scorers: `scorers` (native) OR `defaultScorers` (the importers'
+  // output). Both may hold bare strings ("contains") or objects ({scorer}).
+  const hasTopScorers = config.scorers != null;
+  const topLevelRaw = hasTopScorers ? config.scorers : config.defaultScorers;
+  const topLevelKey = hasTopScorers ? "scorers" : "defaultScorers";
+
+  if (topLevelRaw != null) {
+    if (!Array.isArray(topLevelRaw)) {
+      errors.push(`'${topLevelKey}' must be an array.`);
     } else {
-      for (const s of config.scorers as string[]) {
-        if (!availableScorers.includes(s)) {
+      const topNames = topLevelRaw.map(scorerName).filter(Boolean);
+      for (const s of topNames) {
+        if (!isKnownScorer(s)) {
           errors.push(`Unknown scorer: '${s}'. Available: ${availableScorers.join(", ")}`);
         }
       }
+      for (const s of perCaseScorers) {
+        if (!isKnownScorer(s)) {
+          errors.push(`Unknown scorer in case: '${s}'. Available: ${availableScorers.join(", ")}`);
+        }
+      }
+      // Cache the derived union back onto config for the summary printout.
+      config.scorers = Array.from(new Set([...topNames, ...perCaseScorers]));
     }
-  } else if (assertScorers.length > 0) {
-    // Validate scorer names referenced in per-case assert blocks.
-    for (const s of assertScorers) {
-      if (!availableScorers.includes(s)) {
-        errors.push(`Unknown scorer in assert: '${s}'. Available: ${availableScorers.join(", ")}`);
+  } else if (perCaseScorers.length > 0) {
+    // Validate scorer names referenced only in per-case assert/scorers blocks.
+    for (const s of perCaseScorers) {
+      if (!isKnownScorer(s)) {
+        errors.push(`Unknown scorer in case: '${s}'. Available: ${availableScorers.join(", ")}`);
       }
     }
     // Cache derived list back onto config for the summary printout.
-    (config as any).scorers = Array.from(new Set(assertScorers));
+    config.scorers = Array.from(new Set(perCaseScorers));
   } else {
-    errors.push("Missing 'scorers' field (or per-case 'assert' blocks).");
+    errors.push("Missing 'scorers' field (or 'defaultScorers', or per-case 'assert'/'scorers' blocks).");
   }
 
   // Cases — accept either `input` (native) or `vars` (Promptfoo / init).

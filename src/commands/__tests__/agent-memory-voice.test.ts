@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { jsonResponse } from "../../__tests__/helpers/response-double.js";
 import { rememberMemory, recallMemory, forgetMemory } from "../agent-memory.js";
 import { transcribeVoice, scoreDeepfake } from "../voice.js";
 
@@ -8,7 +9,9 @@ const OPTS = { baseUrl: "https://x.test/api/v1", apiKey: "k" };
 function okFetch(data: unknown) {
   return vi.fn(
     async (_url: string, _init?: RequestInit) =>
-      ({ ok: true, status: 200, json: async () => ({ success: true, data }) }) as unknown as Response,
+      // Real Response: the CLI decodes bodies via `res.text()` at its shared
+      // fail-closed boundary (lib/http.ts), which a `.json()`-only double lacks.
+      jsonResponse({ success: true, data }),
   );
 }
 
@@ -35,7 +38,7 @@ describe("agent-memory CLI API client", () => {
       expect(init?.method).toBe("POST");
       expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer k");
       expect(JSON.parse(String(init?.body))).toMatchObject({ projectId: PROJECT, sessionKey: "s", facts: ["likes tea"] });
-      return { ok: true, status: 201, json: async () => ({ success: true, data: { written: ["likes tea"], skipped: [] } }) } as unknown as Response;
+      return jsonResponse({ success: true, data: { written: ["likes tea"], skipped: [] } }, 201);
     });
     const out = (await rememberMemory({ projectId: PROJECT, sessionKey: "s", facts: ["likes tea"], ...OPTS, fetchImpl: f as unknown as typeof fetch })) as {
       data: { written: string[] };
@@ -48,7 +51,7 @@ describe("agent-memory CLI API client", () => {
       expect(url).toContain("/agent-memory?");
       expect(url).toContain("query=coffee");
       expect(url).toContain("limit=3");
-      return { ok: true, status: 200, json: async () => ({ success: true, data: { semantic: [] } }) } as unknown as Response;
+      return jsonResponse({ success: true, data: { semantic: [] } });
     });
     await recallMemory({ projectId: PROJECT, sessionKey: "s", query: "coffee", limit: 3, ...OPTS, fetchImpl: f as unknown as typeof fetch });
     expect(f).toHaveBeenCalledOnce();
@@ -74,7 +77,7 @@ describe("voice CLI API client", () => {
     const f = vi.fn(async (url: string, init?: RequestInit) => {
       expect(url).toContain("/voice/transcribe");
       expect(JSON.parse(String(init?.body))).toMatchObject({ projectId: PROJECT, audioBase64: "d2F2", language: "en" });
-      return { ok: true, status: 200, json: async () => ({ success: true, data: { text: "hi", words: [] } }) } as unknown as Response;
+      return jsonResponse({ success: true, data: { text: "hi", words: [] } });
     });
     await transcribeVoice({ projectId: PROJECT, audioBase64: "d2F2", language: "en", ...OPTS, fetchImpl: f as unknown as typeof fetch });
     expect(f).toHaveBeenCalledOnce();

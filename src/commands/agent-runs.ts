@@ -7,21 +7,23 @@
  */
 import { Command } from "commander";
 import chalk from "chalk";
+import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody, expectArrayField } from "../lib/http.js";
 
 function baseUrl(): string {
-  return process.env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api/v1";
+  return resolveBaseUrl();
 }
 function apiKey(): string {
-  const k = process.env.EVALGUARD_API_KEY;
+  const k = resolveApiKey();
   if (!k) { console.error(chalk.red("EVALGUARD_API_KEY not set. Run `evalguard init`.")); process.exit(1); }
   return k;
 }
 async function apiFetch(path: string, init: RequestInit = {}): Promise<unknown> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${apiKey()}`, "content-type": "application/json", ...(init.headers ?? {}) },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } })?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
@@ -56,7 +58,12 @@ export function registerAgentRuns(program: Command): void {
         }
       } else {
         console.log(chalk.bold(`\nAgent runs (${body.data.total} total), since ${body.data.since}\n`));
-        for (const r of body.data.runs ?? []) {
+        // `?? []` printed the header row and then nothing, exit 0, when the
+        // body carried no `runs`.
+        const runs = expectArrayField(body.data, "runs", "GET /agent-runs") as NonNullable<
+          typeof body.data.runs
+        >;
+        for (const r of runs) {
           console.log(`  ${String(r.id).slice(0, 8)}  ${r.status}  $${Number(r.cost_usd).toFixed(4)}  ${r.agent_tag ?? "—"}  ${r.end_customer_id ?? ""}`);
         }
       }

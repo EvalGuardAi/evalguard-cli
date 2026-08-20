@@ -9,6 +9,7 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody } from "../lib/http.js";
 
 // Canonical precedence: env > ~/.evalguard/config.json > default. Previously
 // these read only process.env, so `evalguard login` config-file auth was ignored
@@ -25,13 +26,13 @@ function apiKey(): string {
   return k;
 }
 async function apiFetch(path: string): Promise<unknown> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     headers: {
       Authorization: `Bearer ${apiKey()}`,
       "content-type": "application/json",
     },
   });
-  const body = (await res.json().catch(() => null)) as { data?: unknown; error?: { message?: string } } | null;
+  const body = (await decodeJsonBody(res, `${path}`)) as { data?: unknown; error?: { message?: string } } | null;
   if (!res.ok) {
     throw new Error(body?.error?.message ?? `HTTP ${res.status}`);
   }
@@ -220,12 +221,14 @@ export function registerMcp(program: Command): void {
       try {
         const fs = await import("node:fs");
         const cfg = JSON.parse(fs.readFileSync(opts.file, "utf8")) as { server?: unknown; tools?: unknown };
-        const res = await fetch(`${baseUrl()}/security/mcp-predeployment-audit`, {
+        const res = await boundedFetch(`${baseUrl()}/security/mcp-predeployment-audit`, {
           method: "POST",
           headers: { Authorization: `Bearer ${apiKey()}`, "content-type": "application/json" },
           body: JSON.stringify({ projectId: opts.project, server: cfg.server ?? {}, tools: cfg.tools ?? [] }),
         });
-        const body = (await res.json().catch(() => null)) as { data?: McpAuditReport; error?: { message?: string } } | null;
+        const body = (await decodeJsonBody(res, "POST /security/mcp-predeployment-audit")) as
+          | { data?: McpAuditReport; error?: { message?: string } }
+          | null;
         if (!res.ok || !body?.data) throw new Error(body?.error?.message ?? `HTTP ${res.status}`);
         const report = body.data;
         if (opts.json) console.log(JSON.stringify(report, null, 2));

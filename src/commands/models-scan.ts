@@ -8,6 +8,7 @@ import { Command } from "commander";
 import chalk from "chalk";
 import * as fs from "fs";
 import { resolveApiKey, resolveBaseUrl } from "../lib/config.js";
+import { boundedFetch, decodeJsonBody, expectObject, expectResult } from "../lib/http.js";
 
 function baseUrl(): string { return resolveBaseUrl(); }
 function apiKey(): string {
@@ -16,11 +17,11 @@ function apiKey(): string {
   return k;
 }
 async function apiFetch(path: string, init: RequestInit = {}): Promise<unknown> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await boundedFetch(`${baseUrl()}${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${apiKey()}`, "content-type": "application/json", ...(init.headers ?? {}) },
   });
-  const body = await res.json().catch(() => null);
+  const body = await decodeJsonBody(res, `${path}`);
   if (!res.ok) {
     const msg = (body as { error?: { message?: string } })?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
@@ -56,14 +57,23 @@ export function registerModelsPromote(program: Command): void {
     .description("Fetch the CycloneDX-ML attestation document for a scan")
     .option("--out <file>", "Write JSON to file instead of stdout")
     .action(async (scanId: string, opts: { out?: string }) => {
-      const body = (await apiFetch(`/security/model-scan/${encodeURIComponent(scanId)}/attestation`)) as {
-        success: boolean;
-        data: { attestation: Record<string, unknown>; cached: boolean };
-      };
-      const json = JSON.stringify(body.data.attestation, null, 2);
+      // A CycloneDX-ML ATTESTATION is a supply-chain artifact. `body.data.attestation`
+      // was `undefined` for a 200 carrying `{"success":true,"data":{}}`, and
+      // `JSON.stringify(undefined)` is the string "undefined" — which this command
+      // printed, or wrote to `--out`, with exit 0.
+      const result = expectResult<{ attestation: Record<string, unknown>; cached?: boolean }>(
+        await apiFetch(`/security/model-scan/${encodeURIComponent(scanId)}/attestation`),
+        "GET /security/model-scan/:id/attestation",
+        ["attestation"],
+      );
+      const json = JSON.stringify(
+        expectObject(result.attestation, "GET /security/model-scan/:id/attestation"),
+        null,
+        2,
+      );
       if (opts.out) {
         fs.writeFileSync(opts.out, json);
-        console.log(chalk.green(`✓ Attestation written to ${opts.out} (${(json.length / 1024).toFixed(1)} KB, cached=${body.data.cached})`));
+        console.log(chalk.green(`✓ Attestation written to ${opts.out} (${(json.length / 1024).toFixed(1)} KB, cached=${result.cached ?? false})`));
       } else {
         console.log(json);
       }

@@ -6,8 +6,18 @@ import { executeIacScan } from "../iac-scan.js";
 
 /* executeIacScan is the pure executor the .action() wrapper calls — testing it
  * directly avoids the process.exit hijack that races commander's promise
- * runner. The first invocation cold-imports @evalguard/core (large), so the
- * per-test timeout is bumped to 30s (same precedent as repo-scan.test.ts). */
+ * runner. The first invocation cold-imports @evalguard/core (large); that cost
+ * is now paid in this file's import phase (below) rather than absorbed by a
+ * per-test timeout, which is a budget it can outgrow at any load. */
+// Import-phase warm-up. `await import()` inside a test body is billed against
+// `testTimeout`, and this file reaches `@evalguard/core` lazily, so the first
+// case to touch it paid for the whole 2,173-file graph — ~5 s idle, and past
+// the budget under the pre-push sweep. Loading it here moves that cost into
+// the file's import phase, which vitest bills against no per-test budget.
+// Must be top-level `await import`, not a static import: vitest hoists
+// `vi.mock` above static imports. Full rationale: src/__tests__/cli-smoke.test.ts
+await import("@evalguard/core");
+
 describe("executeIacScan — directory walk + AI-infra rules", () => {
   let tmpRoot: string;
 
@@ -39,7 +49,7 @@ describe("executeIacScan — directory walk + AI-infra rules", () => {
     expect(result.bySeverity.critical).toBeGreaterThanOrEqual(1);
     expect(result.flagged).toBeGreaterThanOrEqual(1);
     expect(result.exitCode).toBe(1);
-  }, 30_000);
+  });
 
   it("excludes node_modules / .git from the walk", async () => {
     fs.mkdirSync(path.join(tmpRoot, "node_modules", "pkg"), { recursive: true });
@@ -51,7 +61,7 @@ describe("executeIacScan — directory walk + AI-infra rules", () => {
     expect(result.scannedFiles).toBe(0);
     expect(result.findings).toEqual([]);
     expect(result.exitCode).toBe(0);
-  }, 30_000);
+  });
 
   it("scans a single file passed directly (any extension)", async () => {
     const p = path.join(tmpRoot, "my-deploy");
@@ -59,12 +69,12 @@ describe("executeIacScan — directory walk + AI-infra rules", () => {
     const result = await executeIacScan({ targetAbs: p, failOn: "high", maxBytes: 1_000_000 });
     expect(result.scannedFiles).toBe(1);
     expect(result.findings.some((f) => f.ruleId === "iac-exposed-ai-service-port")).toBe(true);
-  }, 30_000);
+  });
 
   it("clean repo gates pass (exit 0)", async () => {
     fs.writeFileSync(path.join(tmpRoot, "Dockerfile"), 'FROM python:3.12-slim\nCMD ["uvicorn","app","--host","127.0.0.1"]\n');
     const result = await executeIacScan({ targetAbs: tmpRoot, failOn: "low", maxBytes: 1_000_000 });
     expect(result.findings).toEqual([]);
     expect(result.exitCode).toBe(0);
-  }, 30_000);
+  });
 });

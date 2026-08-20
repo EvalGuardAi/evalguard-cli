@@ -26,6 +26,7 @@ import chalk from "chalk";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { parseSeverityGate, severityRank } from "../lib/gate-threshold.js";
 
 type Severity = "low" | "medium" | "high" | "critical";
 
@@ -143,8 +144,17 @@ export async function executeIacScan(opts: IacScanRunOptions): Promise<IacScanRu
   }
 
   const result = scanIacFiles(files);
-  const threshold = SEVERITY_RANK[opts.failOn];
-  const flagged = result.findings.filter((f) => SEVERITY_RANK[f.severity] >= threshold);
+  // `severityRank`, not `SEVERITY_RANK[...]`: a Map lookup cannot return a
+  // prototype member, so a threshold that slipped past the flag parser fails
+  // CLOSED (gate everything) instead of comparing every finding against a
+  // function and flagging nothing.
+  const threshold = severityRank(opts.failOn);
+  if (threshold === null) {
+    throw new Error(
+      `iac-scan: unusable --fail-on '${String(opts.failOn)}' — refusing to run a gate that cannot compare.`,
+    );
+  }
+  const flagged = result.findings.filter((f) => (severityRank(f.severity) ?? 0) >= threshold);
   return {
     target: opts.targetAbs,
     scannedFiles: result.scannedFiles,
@@ -181,11 +191,17 @@ export function registerIacScan(program: Command): void {
         pathArg: string,
         opts: { json: boolean; sarif?: string; failOn: string; maxBytes: string },
       ) => {
-        const failOn = opts.failOn.toLowerCase() as Severity;
-        if (!(failOn in SEVERITY_RANK)) {
+        // Allow-list, never `in`: `--fail-on constructor` satisfied the old
+        // prototype-chain check, made `SEVERITY_RANK[failOn]` a function, and
+        // turned every `rank >= threshold` into a NaN comparison — so the gate
+        // exited 0 over a tree of criticals. See lib/gate-threshold.ts.
+        const parsedFailOn = parseSeverityGate(opts.failOn);
+        if (parsedFailOn === null) {
           console.error(chalk.red(`Invalid --fail-on '${opts.failOn}'. Use low|medium|high|critical.`));
           process.exit(2);
+          return;
         }
+        const failOn = parsedFailOn as Severity;
         const maxBytes = Number(opts.maxBytes);
         if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
           console.error(chalk.red(`Invalid --max-bytes '${opts.maxBytes}'`));
