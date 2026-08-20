@@ -1,6 +1,6 @@
 {
   "name": "@evalguard/cli",
-  "version": "3.3.0",
+  "version": "3.8.1",
   "description": "EvalGuard CLI — LLM evaluation, red-team security scans, prompt firewall, and CI gating from the terminal.",
   "type": "module",
   "bin": { "evalguard": "./bin/evalguard.js" },
